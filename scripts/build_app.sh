@@ -8,6 +8,10 @@ DIST_DIR="$ROOT_DIR/dist"
 APP_PATH="$DIST_DIR/$APP_NAME.app"
 EXECUTABLE_SOURCE="$ROOT_DIR/.build/release/KeepAwake"
 EXECUTABLE_DEST="$APP_PATH/Contents/MacOS/$APP_NAME"
+ICON_SOURCE="$ROOT_DIR/Resources/KeepAwake.icns"
+ICON_DEST="$APP_PATH/Contents/Resources/KeepAwake.icns"
+BATTERY_SCRIPT_SOURCE="$ROOT_DIR/Resources/check_logi_battery.py"
+BATTERY_SCRIPT_DEST="$APP_PATH/Contents/Resources/check_logi_battery.py"
 
 cd "$ROOT_DIR"
 swift build -c release
@@ -15,6 +19,8 @@ swift build -c release
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$EXECUTABLE_SOURCE" "$EXECUTABLE_DEST"
+cp "$ICON_SOURCE" "$ICON_DEST"
+cp "$BATTERY_SCRIPT_SOURCE" "$BATTERY_SCRIPT_DEST"
 
 cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -29,6 +35,8 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
     <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>
     <string>$APP_NAME</string>
+    <key>CFBundleIconFile</key>
+    <string>KeepAwake</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
