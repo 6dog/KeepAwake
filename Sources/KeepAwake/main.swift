@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let menu = NSMenu()
     private let powerStatusItem = NSMenuItem()
+    private let refreshBatteryItem = NSMenuItem()
     private let displayAwakeItem = NSMenuItem()
     private let systemAwakeItem = NSMenuItem()
     private let launchAtLoginItem = NSMenuItem()
@@ -51,9 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureMenu()
         applySavedPowerSettings()
         refreshBattery()
-        batteryTimer = Timer.scheduledTimer(withTimeInterval: Self.batteryRefreshInterval, repeats: true) { [weak self] _ in
-            self?.refreshBattery()
-        }
+        scheduleBatteryRefreshTimer()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -73,6 +72,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         powerStatusItem.isEnabled = false
         menu.addItem(powerStatusItem)
+
+        refreshBatteryItem.target = self
+        refreshBatteryItem.action = #selector(refreshBatteryFromMenu)
+        menu.addItem(refreshBatteryItem)
+
+        menu.addItem(.separator())
 
         displayAwakeItem.target = self
         displayAwakeItem.action = #selector(toggleDisplayAwakeFromMenu)
@@ -113,6 +118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateMenu() {
         powerStatusItem.title = "电源状态：\(powerSummaryTitle)"
+
+        refreshBatteryItem.title = isRefreshingBattery ? "正在刷新电池电量..." : "刷新电池电量"
+        refreshBatteryItem.isEnabled = !isRefreshingBattery
 
         displayAwakeItem.title = "保持屏幕亮起"
         displayAwakeItem.state = isKeepingDisplayAwake ? .on : .off
@@ -159,12 +167,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenu()
     }
 
+    @objc private func refreshBatteryFromMenu() {
+        refreshBattery(resetTimer: true)
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    private func refreshBattery() {
+    private func scheduleBatteryRefreshTimer() {
+        batteryTimer?.invalidate()
+        batteryTimer = Timer.scheduledTimer(withTimeInterval: Self.batteryRefreshInterval, repeats: true) { [weak self] _ in
+            self?.refreshBattery()
+        }
+    }
+
+    private func refreshBattery(resetTimer: Bool = false) {
         guard !isRefreshingBattery else { return }
+        if resetTimer {
+            scheduleBatteryRefreshTimer()
+        }
         isRefreshingBattery = true
         batteryReader.read { [weak self] status in
             self?.batteryStatus = status
