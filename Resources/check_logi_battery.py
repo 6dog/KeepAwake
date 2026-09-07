@@ -57,7 +57,9 @@ def _hidpp_call(dev, dev_idx, feature_idx, function_idx, params=b"", timeout_ms=
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         rsp = dev.read(LONG_LEN, timeout_ms=200)
-        if not rsp or len(rsp) < 4:
+        # Every response consumed below needs bytes 0...6. Some HID backends can
+        # return truncated packets, so ignore those instead of indexing past them.
+        if not rsp or len(rsp) < 7:
             continue
         rsp = bytes(rsp)
         if rsp[0] not in (SHORT, LONG) or rsp[1] != dev_idx:

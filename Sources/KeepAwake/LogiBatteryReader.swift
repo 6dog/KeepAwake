@@ -24,7 +24,11 @@ struct LogiBatteryStatus {
         percent: Int,
         deviceStatus: String?
     ) -> LogiBatteryStatus {
-        LogiBatteryStatus(
+        guard (0...100).contains(percent) else {
+            return .unavailable("invalid battery percent")
+        }
+
+        return LogiBatteryStatus(
             availability: .available,
             percent: percent,
             deviceStatus: deviceStatus,
@@ -68,6 +72,8 @@ struct LogiBatteryStatus {
             return "鼠标休眠或超出范围"
         case "no battery feature":
             return "设备不支持电量读取"
+        case "invalid battery percent":
+            return "设备返回了无效电量"
         default:
             if errorMessage.hasPrefix("open failed") {
                 return "无法打开接收器"
@@ -161,13 +167,28 @@ final class LogiBatteryReader {
 
     private func pythonCandidates() -> [String] {
         let environment = ProcessInfo.processInfo.environment
-        let rawCandidates = [
-            environment["LOGI_BATTERY_PYTHON"],
+        var rawCandidates = [environment["LOGI_BATTERY_PYTHON"]].compactMap { $0 }
+
+        if let versionsDirectory = try? FileManager.default.contentsOfDirectory(
+            atPath: "/Library/Frameworks/Python.framework/Versions"
+        ) {
+            rawCandidates.append(contentsOf: versionsDirectory
+                .sorted(by: >)
+                .map { "/Library/Frameworks/Python.framework/Versions/\($0)/bin/python3" })
+        }
+
+        if let path = environment["PATH"] {
+            rawCandidates.append(contentsOf: path
+                .split(separator: ":")
+                .map { "\($0)/python3" })
+        }
+
+        rawCandidates.append(contentsOf: [
             "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3",
             "/usr/local/bin/python3",
             "/opt/homebrew/bin/python3",
             "/usr/bin/python3"
-        ].compactMap { $0 }
+        ])
 
         var seen = Set<String>()
         return rawCandidates.filter { path in

@@ -20,4 +20,4 @@
 
 ## Logitech 电量读取
 
-电量读取脚本位于 `Resources/check_logi_battery.py`，打包时会复制到 app bundle 的 `Contents/Resources`。运行环境需要本机可用的 `python3`，并安装 `hid` Python 包；也可以通过 `LOGI_BATTERY_PYTHON` 指定 Python 路径。
+电量读取脚本位于 `Resources/check_logi_battery.py`，打包时会复制到 app bundle 的 `Contents/Resources`。运行环境需要本机可用的 `python3`，并安装 `hid` Python 包；应用会从 Python Framework、`PATH` 和常见 Homebrew 路径自动查找，也可以通过 `LOGI_BATTERY_PYTHON` 指定 Python 路径。
