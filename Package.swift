@@ -17,6 +17,10 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("IOKit")
             ]
+        ),
+        .testTarget(
+            name: "KeepAwakeTests",
+            dependencies: ["KeepAwake"]
         )
     ]
 )

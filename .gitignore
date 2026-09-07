@@ -1,5 +1,8 @@
 .DS_Store
 .build/
+__pycache__/
+*.pyc
 dist/
+*.app/
 *.xcuserstate
 DerivedData/
