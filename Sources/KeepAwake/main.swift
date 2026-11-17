@@ -39,7 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private let builtInDisplay = BuiltInDisplayController()
+    private let builtInStatusItem = NSMenuItem()
+    private let autoBuiltInItem = NSMenuItem()
+    private let forceBuiltInItem = NSMenuItem()
     private let menu = NSMenu()
+    private let batteryStatusItem = NSMenuItem()
     private let powerStatusItem = NSMenuItem()
     private let refreshBatteryItem = NSMenuItem()
     private let displayAwakeItem = NSMenuItem()
@@ -50,9 +55,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
         configureMenu()
+        builtInDisplay.onChange = { [weak self] in self?.updateMenu() }
+        builtInDisplay.start()
         applySavedPowerSettings()
         refreshBattery()
         scheduleBatteryRefreshTimer()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        builtInDisplay.prepareToQuit() ? .terminateNow : .terminateCancel
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -70,6 +81,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func configureMenu() {
         menu.delegate = self
 
+        batteryStatusItem.isEnabled = false
+        menu.addItem(batteryStatusItem)
+
         powerStatusItem.isEnabled = false
         menu.addItem(powerStatusItem)
 
@@ -86,6 +100,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         systemAwakeItem.target = self
         systemAwakeItem.action = #selector(toggleSystemAwakeFromMenu)
         menu.addItem(systemAwakeItem)
+
+        menu.addItem(.separator())
+        builtInStatusItem.isEnabled = false
+        menu.addItem(builtInStatusItem)
+        autoBuiltInItem.title = "外接显示器时自动关闭内置屏幕"
+        autoBuiltInItem.target = self
+        autoBuiltInItem.action = #selector(toggleAutoBuiltIn)
+        menu.addItem(autoBuiltInItem)
+        forceBuiltInItem.title = "保持内置屏幕开启"
+        forceBuiltInItem.target = self
+        forceBuiltInItem.action = #selector(toggleForceBuiltIn)
+        menu.addItem(forceBuiltInItem)
 
         launchAtLoginItem.target = self
         launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
@@ -113,10 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             preventsSystemSleep: isPreventingSystemSleep
         )
         button.title = ""
-        button.toolTip = "\(batteryStatus.tooltipTitle) - \(powerSummaryTitle)"
+        // Keep details in the menu to avoid a lingering AppKit help tag.
+        button.toolTip = nil
+        button.setAccessibilityLabel("\(batteryStatus.tooltipTitle) - \(powerSummaryTitle)")
     }
 
     private func updateMenu() {
+        batteryStatusItem.title = batteryStatus.tooltipTitle
         powerStatusItem.title = "电源状态：\(powerSummaryTitle)"
 
         refreshBatteryItem.title = isRefreshingBattery ? "正在刷新电池电量..." : "刷新电池电量"
@@ -128,6 +157,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         systemAwakeItem.title = "防止电脑自动睡眠（屏幕可熄灭）"
         systemAwakeItem.state = isPreventingSystemSleep ? .on : .off
 
+        builtInStatusItem.title = builtInDisplay.status
+        autoBuiltInItem.state = builtInDisplay.automatic ? .on : .off
+        autoBuiltInItem.isEnabled = builtInDisplay.available || builtInDisplay.automatic
+        forceBuiltInItem.state = builtInDisplay.forceOn ? .on : .off
         updateLaunchAtLoginMenuItem()
     }
 
@@ -142,6 +175,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case (false, false):
             return "未启用防睡眠"
         }
+    }
+
+    @objc private func toggleAutoBuiltIn() {
+        builtInDisplay.setAutomatic(!builtInDisplay.automatic)
+    }
+
+    @objc private func toggleForceBuiltIn() {
+        builtInDisplay.setForceOn(!builtInDisplay.forceOn)
     }
 
     @objc private func toggleDisplayAwakeFromMenu() {
@@ -385,7 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let plist: [String: Any] = [
             "Label": "com.jesseyun.KeepAwake.login",
-            "ProgramArguments": ["/usr/bin/open", "-n", appBundleURL.path],
+            "ProgramArguments": ["/usr/bin/open", appBundleURL.path],
             "RunAtLoad": true,
             "LimitLoadToSessionType": "Aqua"
         ]
