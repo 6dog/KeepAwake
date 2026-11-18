@@ -1,526 +1,219 @@
 import AppKit
-import IOKit.pwr_mgt
+import SwiftUI
+import UniformTypeIdentifiers
+import Darwin
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private static let batteryRefreshInterval: TimeInterval = 24 * 60 * 60
-
-    private enum DefaultsKey {
-        static let keepDisplayAwake = "keepDisplayAwake"
-        static let preventSystemSleep = "preventSystemSleep"
-        static let legacyAwakeMode = "awakeMode"
-    }
-
-    private var statusItem: NSStatusItem!
-    private var displayAssertionID = IOPMAssertionID(0)
-    private var systemAssertionID = IOPMAssertionID(0)
-    private let batteryReader = LogiBatteryReader()
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let instance = InstanceLock()
+    private let state = AppState()
+    private let diagnostics = Diagnostics.shared
+    private lazy var power = PowerController()
+    private lazy var display = BuiltInDisplayController()
+    private lazy var battery = LogiBatteryReader()
+    private let login = LoginItemManager()
+    private var item: NSStatusItem!
+    private var panel: PanelPresenter!
     private var batteryTimer: Timer?
-    private var isRefreshingBattery = false {
-        didSet {
-            updateMenu()
-        }
-    }
-    private var batteryStatus = LogiBatteryStatus.loading {
-        didSet {
-            updateStatusItem()
-            updateMenu()
-        }
-    }
-    private var isKeepingDisplayAwake = false {
-        didSet {
-            updateStatusItem()
-            updateMenu()
-        }
-    }
-    private var isPreventingSystemSleep = false {
-        didSet {
-            updateStatusItem()
-            updateMenu()
-        }
-    }
-
-    private let builtInDisplay = BuiltInDisplayController()
-    private let builtInStatusItem = NSMenuItem()
-    private let builtInErrorItem = NSMenuItem()
-    private let autoBuiltInItem = NSMenuItem()
-    private let forceBuiltInItem = NSMenuItem()
-    private let menu = NSMenu()
-    private let batteryStatusItem = NSMenuItem()
-    private let powerStatusItem = NSMenuItem()
-    private let refreshBatteryItem = NSMenuItem()
-    private let displayAwakeItem = NSMenuItem()
-    private let systemAwakeItem = NSMenuItem()
-    private let launchAtLoginItem = NSMenuItem()
+    private var summaryTimer: Timer?
+    private var observers: [NSObjectProtocol] = []
+    private var started = false
+    private var terminating = false
+    private var terminationSignals: [DispatchSourceSignal] = []
+    private var iconSignature: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        configureStatusItem()
-        configureMenu()
-        builtInDisplay.onChange = { [weak self] in self?.updateMenu() }
-        builtInDisplay.start()
-        applySavedPowerSettings()
-        refreshBattery()
-        scheduleBatteryRefreshTimer()
-    }
-
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        builtInDisplay.prepareToQuit() ? .terminateNow : .terminateCancel
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        batteryTimer?.invalidate()
-        releaseDisplayAwakeAssertion(persist: false)
-        releaseSystemSleepAssertion(persist: false)
-    }
-
-    private func configureStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.imagePosition = .imageOnly
-        updateStatusItem()
-    }
-
-    private func configureMenu() {
-        menu.delegate = self
-        menu.autoenablesItems = false
-
-        batteryStatusItem.isEnabled = false
-        menu.addItem(batteryStatusItem)
-
-        powerStatusItem.isEnabled = false
-        menu.addItem(powerStatusItem)
-
-        refreshBatteryItem.target = self
-        refreshBatteryItem.action = #selector(refreshBatteryFromMenu)
-        menu.addItem(refreshBatteryItem)
-
-        menu.addItem(.separator())
-
-        displayAwakeItem.target = self
-        displayAwakeItem.action = #selector(toggleDisplayAwakeFromMenu)
-        menu.addItem(displayAwakeItem)
-
-        systemAwakeItem.target = self
-        systemAwakeItem.action = #selector(toggleSystemAwakeFromMenu)
-        menu.addItem(systemAwakeItem)
-
-        menu.addItem(.separator())
-        builtInStatusItem.isEnabled = false
-        menu.addItem(builtInStatusItem)
-        builtInErrorItem.isEnabled = false
-        menu.addItem(builtInErrorItem)
-        autoBuiltInItem.title = "外接显示器时自动关闭内置屏幕"
-        autoBuiltInItem.target = self
-        autoBuiltInItem.action = #selector(toggleAutoBuiltIn)
-        menu.addItem(autoBuiltInItem)
-        forceBuiltInItem.title = "保持内置屏幕开启"
-        forceBuiltInItem.target = self
-        forceBuiltInItem.action = #selector(toggleForceBuiltIn)
-        menu.addItem(forceBuiltInItem)
-
-        launchAtLoginItem.target = self
-        launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
-        menu.addItem(.separator())
-        menu.addItem(launchAtLoginItem)
-
-        let quitItem = NSMenuItem(title: "退出 Keep Awake", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(.separator())
-        menu.addItem(quitItem)
-
-        statusItem.menu = menu
-        updateMenu()
-    }
-
-    func menuWillOpen(_ menu: NSMenu) {
-        updateMenu()
-    }
-
-    private func updateStatusItem() {
-        guard let button = statusItem?.button else { return }
-        button.image = makeDisplayBatteryImage(
-            percent: batteryStatus.percent,
-            keepsDisplayAwake: isKeepingDisplayAwake,
-            preventsSystemSleep: isPreventingSystemSleep
-        )
-        button.title = ""
-        // Keep details in the menu to avoid a lingering AppKit help tag.
-        button.toolTip = nil
-        button.setAccessibilityLabel("\(batteryStatus.tooltipTitle) - \(powerSummaryTitle)")
-    }
-
-    private func updateMenu() {
-        batteryStatusItem.title = batteryStatus.tooltipTitle
-        powerStatusItem.title = "电源状态：\(powerSummaryTitle)"
-
-        refreshBatteryItem.title = isRefreshingBattery ? "正在刷新电池电量..." : "刷新电池电量"
-        refreshBatteryItem.isEnabled = !isRefreshingBattery
-
-        displayAwakeItem.title = "保持屏幕亮起"
-        displayAwakeItem.state = isKeepingDisplayAwake ? .on : .off
-
-        systemAwakeItem.title = "防止电脑自动睡眠（屏幕可熄灭）"
-        systemAwakeItem.state = isPreventingSystemSleep ? .on : .off
-
-        builtInStatusItem.title = builtInDisplay.status
-        builtInErrorItem.isHidden = builtInDisplay.lastFailure == nil
-        builtInErrorItem.title = builtInDisplay.lastFailure.map { "上次原因：\($0)" } ?? ""
-        autoBuiltInItem.state = builtInDisplay.automatic ? .on : .off
-        autoBuiltInItem.isEnabled = builtInDisplay.available || builtInDisplay.automatic
-        forceBuiltInItem.state = builtInDisplay.forceOn ? .on : .off
-        updateLaunchAtLoginMenuItem()
-    }
-
-    private var powerSummaryTitle: String {
-        switch (isKeepingDisplayAwake, isPreventingSystemSleep) {
-        case (true, true):
-            return "屏幕保持亮起，电脑不自动睡眠"
-        case (true, false):
-            return "屏幕保持亮起"
-        case (false, true):
-            return "电脑不自动睡眠，屏幕可熄灭"
-        case (false, false):
-            return "未启用防睡眠"
-        }
-    }
-
-    @objc private func toggleAutoBuiltIn() {
-        builtInDisplay.setAutomatic(!builtInDisplay.automatic)
-    }
-
-    @objc private func toggleForceBuiltIn() {
-        builtInDisplay.setForceOn(!builtInDisplay.forceOn)
-    }
-
-    @objc private func toggleDisplayAwakeFromMenu() {
-        setDisplayAwake(!isKeepingDisplayAwake)
-    }
-
-    @objc private func toggleSystemAwakeFromMenu() {
-        if isPreventingSystemSleep, isKeepingDisplayAwake {
-            setDisplayAwake(false)
-            setSystemSleepPrevention(false)
-        } else {
-            setSystemSleepPrevention(!isPreventingSystemSleep)
-        }
-    }
-
-    @objc private func toggleLaunchAtLogin() {
         do {
-            try setLaunchAtLoginEnabled(!isLaunchAtLoginEnabled)
+            guard try instance.acquire() else { exit(0) }
         } catch {
-            showLaunchAtLoginError(error)
+            let alert = NSAlert(); alert.messageText = "无法启动 Keep Awake"; alert.informativeText = Diagnostics.sanitize(error.localizedDescription)
+            alert.runModal(); NSApp.terminate(nil); return
         }
-
-        updateMenu()
-    }
-
-    @objc private func refreshBatteryFromMenu() {
-        refreshBattery(resetTimer: true)
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
-
-    private func scheduleBatteryRefreshTimer() {
-        batteryTimer?.invalidate()
-        batteryTimer = Timer.scheduledTimer(withTimeInterval: Self.batteryRefreshInterval, repeats: true) { [weak self] _ in
-            self?.refreshBattery()
-        }
-    }
-
-    private func refreshBattery(resetTimer: Bool = false) {
-        guard !isRefreshingBattery else { return }
-        if resetTimer {
-            scheduleBatteryRefreshTimer()
-        }
-        isRefreshingBattery = true
-        batteryReader.read { [weak self] status in
-            self?.batteryStatus = status
-            self?.isRefreshingBattery = false
-        }
-    }
-
-    private func applySavedPowerSettings() {
-        let keepDisplayAwake = Self.savedKeepDisplayAwake()
-        setDisplayAwake(keepDisplayAwake, persist: false)
-        if !keepDisplayAwake {
-            setSystemSleepPrevention(Self.savedPreventSystemSleep(), persist: false)
-        }
-    }
-
-    private static func savedKeepDisplayAwake() -> Bool {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: DefaultsKey.keepDisplayAwake) != nil {
-            return defaults.bool(forKey: DefaultsKey.keepDisplayAwake)
-        }
-
-        if defaults.string(forKey: DefaultsKey.legacyAwakeMode) == "allowDisplaySleep" {
-            return false
-        }
-
-        return true
-    }
-
-    private static func savedPreventSystemSleep() -> Bool {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: DefaultsKey.preventSystemSleep) != nil {
-            return defaults.bool(forKey: DefaultsKey.preventSystemSleep)
-        }
-
-        return defaults.string(forKey: DefaultsKey.legacyAwakeMode) == "allowDisplaySleep"
-    }
-
-    private func setDisplayAwake(_ enabled: Bool, persist: Bool = true) {
-        if enabled {
-            if createDisplayAwakeAssertion(persist: persist) {
-                setSystemSleepPrevention(true, persist: persist)
+        diagnostics.beginSession(); started = true
+        for code in [SIGTERM, SIGINT] {
+            signal(code, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: code, queue: .main)
+            source.setEventHandler { [weak self] in
+                guard let self, !self.terminating else { return }
+                self.diagnostics.record("lifecycle", "termination_signal", fields: ["signal": String(code)])
+                NSApp.terminate(nil)
             }
-        } else {
-            releaseDisplayAwakeAssertion(persist: persist)
+            terminationSignals.append(source); source.resume()
+        }
+        state.choosePower = { [weak self] mode in
+            guard let self else { return }
+            self.power.apply(mode); self.synchronize()
+        }
+        state.chooseAutomatic = { [weak self] enabled in self?.display.setAutomatic(enabled); self?.synchronize() }
+        state.refreshBattery = { [weak self] in self?.readBattery(trigger: "user") }
+        display.onChange = { [weak self] in self?.synchronize() }
+        configurePanel()
+        power.apply(PowerMode.saved(in: .standard, diagnostics: diagnostics), persist: false, trigger: "startup")
+        display.start()
+        synchronize()
+        readBattery(trigger: "startup")
+        let batteryPoll = Timer(timeInterval: 86400, repeats: true) { [weak self] _ in self?.readBattery(trigger: "timer") }
+        batteryTimer = batteryPoll; RunLoop.main.add(batteryPoll, forMode: .common)
+        let summary = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.synchronize(); self.diagnostics.record("application", "summary", fields: self.snapshot())
+        }
+        summaryTimer = summary; RunLoop.main.add(summary, forMode: .common)
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification] {
+            observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.diagnostics.record("lifecycle", name.rawValue, fields: self.snapshot())
+                self.synchronize()
+            })
         }
     }
-
-    private func setSystemSleepPrevention(_ enabled: Bool, persist: Bool = true) {
-        if enabled {
-            createSystemSleepAssertion(persist: persist)
-        } else {
-            releaseSystemSleepAssertion(persist: persist)
-        }
+    private func configurePanel() {
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.target = self; item.button?.action = #selector(statusClicked)
+        item.button?.sendAction(on: [.leftMouseDown, .rightMouseUp])
+        item.button?.imagePosition = .imageOnly
+        let hosting = NSHostingController(rootView: ControlPanel(state: state))
+        hosting.sizingOptions = [.preferredContentSize]
+        panel = PanelPresenter(content: hosting, diagnostics: diagnostics)
     }
-
-    @discardableResult
-    private func createDisplayAwakeAssertion(persist: Bool) -> Bool {
-        guard displayAssertionID == 0 else {
-            isKeepingDisplayAwake = true
-            if persist {
-                UserDefaults.standard.set(true, forKey: DefaultsKey.keepDisplayAwake)
+    @objc private func statusClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            panel.close(reason: "context_menu")
+            let menu = NSMenu(); menu.autoenablesItems = false
+            func add(_ title: String, action: Selector?, checked: Bool = false) {
+                let row = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                row.target = self; row.state = checked ? .on : .off; row.isEnabled = action != nil
+                menu.addItem(row)
             }
-            return true
+            add(login.exists && !login.matchesCurrentApp ? "修复开机自动启动路径" : "开机自动启动", action: #selector(toggleLogin), checked: login.matchesCurrentApp)
+            add(diagnostics.isDetailed ? "关闭详细日志" : "详细日志（30 分钟）", action: #selector(toggleDetailed), checked: diagnostics.isDetailed)
+            add("打开日志文件夹", action: #selector(openLogs))
+            add("导出诊断包…", action: #selector(exportDiagnostic))
+            menu.addItem(.separator())
+            add("Keep Awake \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "开发版")", action: nil)
+            add("退出 Keep Awake", action: #selector(quit))
+            if let button = item.button { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button) }
+        } else if let button = item.button, !terminating {
+            panel.toggle(anchor: button, event: NSApp.currentEvent)
         }
-
-        var newAssertionID = IOPMAssertionID(0)
-        let result = IOPMAssertionCreateWithName(
-            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
-            IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            "Keep Awake - Prevent display sleep" as CFString,
-            &newAssertionID
-        )
-
-        if result == kIOReturnSuccess {
-            displayAssertionID = newAssertionID
-            isKeepingDisplayAwake = true
-            if persist {
-                UserDefaults.standard.set(true, forKey: DefaultsKey.keepDisplayAwake)
+    }
+    private func showPanel() {
+        guard started, !terminating, let button = item?.button else { return }
+        panel.show(anchor: button)
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPanel()
+        return false
+    }
+    private func synchronize() {
+        func update<T: Equatable>(_ key: ReferenceWritableKeyPath<AppState, T>, _ value: T) {
+            if state[keyPath: key] != value { state[keyPath: key] = value }
+        }
+        update(\.powerMode, power.mode); update(\.powerError, power.lastError)
+        update(\.automatic, display.automatic); update(\.screenStatus, display.status)
+        update(\.screenError, display.lastFailure); update(\.screenAvailable, display.available); update(\.screenBusy, display.isBusy)
+        update(\.logError, diagnostics.error); update(\.detailed, diagnostics.isDetailed)
+        let signature = "\(state.battery ?? -1):\(power.displayID != 0):\(power.systemID != 0)"
+        if signature != iconSignature {
+            iconSignature = signature
+            item?.button?.image = StatusIcon.make(percent: state.battery, keepsDisplayAwake: power.displayID != 0, preventsSystemSleep: power.systemID != 0)
+            item?.button?.toolTip = nil
+            item?.button?.setAccessibilityLabel("Logitech 电量 \(state.battery.map { "\($0)%" } ?? "未知")，\(power.mode.title)")
+        }
+    }
+    private func readBattery(trigger: String) {
+        guard !state.refreshingBattery, !terminating else { return }
+        diagnostics.record("battery", "refresh_trigger", fields: ["trigger": trigger])
+        state.refreshingBattery = true
+        battery.read { [weak self] result in
+            guard let self else { return }
+            self.state.refreshingBattery = false
+            guard !self.terminating else { return }
+            self.state.battery = result.percent
+            self.state.batteryError = result.errorMessage.map(Diagnostics.sanitize)
+            if result.percent != nil { self.state.batteryUpdated = Date() }
+            self.synchronize()
+        }
+    }
+    private func snapshot() -> [String: String] {
+        var result = ["version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "development",
+                      "os": ProcessInfo.processInfo.operatingSystemVersionString,
+                      "battery.percent": state.battery.map(String.init) ?? "unavailable",
+                      "battery.lastUpdate": state.batteryUpdated.map { ISO8601DateFormatter().string(from: $0) } ?? "none",
+                      "battery.error": state.batteryError ?? "", "login.exists": String(login.exists), "login.valid": String(login.matchesCurrentApp),
+                      "diagnostics.detailed": String(diagnostics.isDetailed)]
+        for (key, value) in power.snapshot { result["power.\(key)"] = value }
+        for (key, value) in display.snapshot { result["display.\(key)"] = value }
+        for (key, value) in PowerController.systemSummary() { result["systemAssertions.\(key)"] = value }
+        return result
+    }
+    @objc private func exportDiagnostic() {
+        guard !state.exporting, !terminating else { return }
+        panel.close(reason: "export")
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.zip]
+        panel.nameFieldStringValue = "KeepAwake-诊断-\(Date().formatted(.iso8601.year().month().day().dateSeparator(.dash))).zip"
+        panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            self.state.exporting = true
+            self.diagnostics.record("diagnostics", "export_requested")
+            DiagnosticExporter().export(to: url, snapshot: self.snapshot()) { [weak self] result in
+                guard let self else { return }
+                self.state.exporting = false
+                switch result {
+                case .success: self.state.notice = "诊断包已保存。"
+                case .failure(let error):
+                    self.diagnostics.failure("diagnostics", "export_failed", error)
+                    self.state.notice = "导出失败：\(Diagnostics.sanitize(error.localizedDescription))"
+                }
+                self.synchronize()
             }
-            return true
-        } else {
-            isKeepingDisplayAwake = false
-            if persist {
-                UserDefaults.standard.set(false, forKey: DefaultsKey.keepDisplayAwake)
-            }
-            showAssertionError(result)
-            return false
         }
     }
-
-    private func releaseDisplayAwakeAssertion(persist: Bool) {
-        if displayAssertionID != 0 {
-            IOPMAssertionRelease(displayAssertionID)
-            displayAssertionID = 0
-        }
-        isKeepingDisplayAwake = false
-        if persist {
-            UserDefaults.standard.set(false, forKey: DefaultsKey.keepDisplayAwake)
-        }
-    }
-
-    private func createSystemSleepAssertion(persist: Bool) {
-        guard systemAssertionID == 0 else {
-            isPreventingSystemSleep = true
-            if persist {
-                UserDefaults.standard.set(true, forKey: DefaultsKey.preventSystemSleep)
-            }
-            return
-        }
-
-        var newAssertionID = IOPMAssertionID(0)
-        let result = IOPMAssertionCreateWithName(
-            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-            IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            "Keep Awake - Prevent system sleep" as CFString,
-            &newAssertionID
-        )
-
-        if result == kIOReturnSuccess {
-            systemAssertionID = newAssertionID
-            isPreventingSystemSleep = true
-            if persist {
-                UserDefaults.standard.set(true, forKey: DefaultsKey.preventSystemSleep)
-            }
-        } else {
-            isPreventingSystemSleep = false
-            if persist {
-                UserDefaults.standard.set(false, forKey: DefaultsKey.preventSystemSleep)
-            }
-            showAssertionError(result)
+    @objc private func toggleDetailed() { diagnostics.setDetailed(!diagnostics.isDetailed); synchronize() }
+    @objc private func openLogs() { NSWorkspace.shared.open(diagnostics.directory) }
+    @objc private func toggleLogin() {
+        let enabled = !login.matchesCurrentApp
+        do {
+            try login.setEnabled(enabled)
+            diagnostics.record("login", "updated", fields: ["enabled": String(enabled), "valid": String(login.matchesCurrentApp)])
+        } catch {
+            diagnostics.failure("login", "failed", error)
+            state.notice = "登录启动设置失败：\(Diagnostics.sanitize(error.localizedDescription))"
         }
     }
-
-    private func releaseSystemSleepAssertion(persist: Bool) {
-        if systemAssertionID != 0 {
-            IOPMAssertionRelease(systemAssertionID)
-            systemAssertionID = 0
-        }
-        isPreventingSystemSleep = false
-        if persist {
-            UserDefaults.standard.set(false, forKey: DefaultsKey.preventSystemSleep)
-        }
-    }
-
-    private func updateLaunchAtLoginMenuItem() {
-        launchAtLoginItem.title = "开机自动启动"
-        launchAtLoginItem.state = isLaunchAtLoginEnabled ? .on : .off
-        launchAtLoginItem.isEnabled = currentAppBundleURL != nil
-    }
-
-    private var isLaunchAtLoginEnabled: Bool {
-        FileManager.default.fileExists(atPath: launchAgentURL.path)
-    }
-
-    private var launchAgentURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/com.jesseyun.KeepAwake.login.plist")
-    }
-
-    private var currentAppBundleURL: URL? {
-        let bundleURL = Bundle.main.bundleURL
-        if bundleURL.pathExtension == "app" {
-            return bundleURL
-        }
-
-        var currentURL = Bundle.main.executableURL
-        while let url = currentURL {
-            if url.pathExtension == "app" {
-                return url
-            }
-            currentURL = url.deletingLastPathComponent()
-        }
-
-        return nil
-    }
-
-    private func setLaunchAtLoginEnabled(_ enabled: Bool) throws {
-        if enabled {
-            try writeLaunchAgent()
-        } else if FileManager.default.fileExists(atPath: launchAgentURL.path) {
-            try FileManager.default.removeItem(at: launchAgentURL)
-        }
-    }
-
-    private func writeLaunchAgent() throws {
-        guard let appBundleURL = currentAppBundleURL else {
-            throw NSError(
-                domain: "KeepAwake",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "请从 Keep Awake.app 启动后再开启。"]
-            )
-        }
-
-        let launchAgentsDirectory = launchAgentURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: launchAgentsDirectory, withIntermediateDirectories: true)
-
-        let plist: [String: Any] = [
-            "Label": "com.jesseyun.KeepAwake.login",
-            "ProgramArguments": ["/usr/bin/open", appBundleURL.path],
-            "RunAtLoad": true,
-            "LimitLoadToSessionType": "Aqua"
-        ]
-        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-        try data.write(to: launchAgentURL, options: .atomic)
-    }
-
-    private func showAssertionError(_ result: IOReturn) {
-        let alert = NSAlert()
-        alert.messageText = "Keep Awake 无法启用。"
-        alert.informativeText = "IOKit 返回错误代码 \(result)。"
-        alert.alertStyle = .warning
-        alert.runModal()
-    }
-
-    private func showLaunchAtLoginError(_ error: Error) {
-        let alert = NSAlert()
-        alert.messageText = "无法修改开机自动启动。"
-        alert.informativeText = error.localizedDescription
-        alert.alertStyle = .warning
-        alert.runModal()
-    }
-
-    private func makeDisplayBatteryImage(
-        percent: Int?,
-        keepsDisplayAwake: Bool,
-        preventsSystemSleep: Bool
-    ) -> NSImage {
-        let size = NSSize(width: 30, height: 20)
-        let image = NSImage(size: size, flipped: false) { _ in
-            let primary = NSColor.labelColor
-            let activeScreenColor = NSColor.white
-            let inactive = primary.withAlphaComponent(0.62)
-            let screenRect = NSRect(x: 2.0, y: 5.0, width: 26.0, height: 13.0)
-            let standRect = NSRect(x: 13.3, y: 2.5, width: 3.4, height: 2.8)
-            let baseRect = NSRect(x: 9.2, y: 1.0, width: 11.6, height: 1.8)
-            let strokeColor = keepsDisplayAwake ? activeScreenColor : inactive
-            let baseColor = primary.withAlphaComponent(preventsSystemSleep ? 1.0 : 0.38)
-
-            if keepsDisplayAwake {
-                activeScreenColor.setFill()
-                NSBezierPath(roundedRect: screenRect.insetBy(dx: 1.0, dy: 1.0), xRadius: 2.0, yRadius: 2.0).fill()
-            }
-
-            strokeColor.setStroke()
-            let screenPath = NSBezierPath(roundedRect: screenRect, xRadius: 2.7, yRadius: 2.7)
-            screenPath.lineWidth = keepsDisplayAwake ? 1.65 : 1.25
-            screenPath.stroke()
-
-            baseColor.setFill()
-            NSBezierPath(roundedRect: standRect, xRadius: 0.8, yRadius: 0.8).fill()
-            NSBezierPath(roundedRect: baseRect, xRadius: 0.9, yRadius: 0.9).fill()
-
-            if preventsSystemSleep {
-                let indicatorRect = NSRect(x: 3.7, y: 2.0, width: 3.8, height: 2.0)
-                NSBezierPath(roundedRect: indicatorRect, xRadius: 1.0, yRadius: 1.0).fill()
-            }
-
-            let percentText = percent.map { "\($0)" } ?? "?"
-            let fontSize: CGFloat = percentText.count >= 3 ? 6.1 : 7.2
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold),
-                .foregroundColor: primary
-            ]
-            let textSize = percentText.size(withAttributes: attributes)
-            let textRect = NSRect(
-                x: screenRect.midX - textSize.width / 2.0,
-                y: screenRect.midY - textSize.height / 2.0 - 0.2,
-                width: textSize.width,
-                height: textSize.height
-            )
-
-            if keepsDisplayAwake, let context = NSGraphicsContext.current {
-                context.saveGraphicsState()
-                context.compositingOperation = .destinationOut
-                percentText.draw(in: textRect, withAttributes: attributes)
-                context.restoreGraphicsState()
+    @objc private func quit() { NSApp.terminate(nil) }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard started else { return .terminateNow }
+        guard !terminating else { return .terminateCancel }
+        terminating = true; state.quitting = true
+        battery.cancel()
+        diagnostics.record("lifecycle", "quit_requested", fields: snapshot())
+        display.prepareToQuit { [weak self] success in
+            guard let self else { return }
+            if !success {
+                self.terminating = false; self.state.quitting = false
+                self.state.notice = "内置屏幕恢复失败，退出已取消。"
+                self.synchronize(); NSApp.reply(toApplicationShouldTerminate: false)
             } else {
-                percentText.draw(in: textRect, withAttributes: attributes)
+                self.power.apply(.system, persist: false, trigger: "exit")
+                DispatchQueue.global(qos: .utility).async {
+                    self.diagnostics.endSession()
+                    RunLoop.main.perform(inModes: [.common]) { NSApp.reply(toApplicationShouldTerminate: true) }
+                    CFRunLoopWakeUp(CFRunLoopGetMain())
+                }
             }
-
-            return true
         }
-        image.isTemplate = false
-        return image
+        return .terminateLater
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        batteryTimer?.invalidate(); summaryTimer?.invalidate()
+        terminationSignals.forEach { $0.cancel() }
+        for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
     }
 }
-
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

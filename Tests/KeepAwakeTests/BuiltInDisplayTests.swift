@@ -45,22 +45,57 @@ final class BuiltInDisplayTests: XCTestCase {
     private var backend: FakeDisplayBackend!
     private var controller: BuiltInDisplayController!
     private var clock: Date!
+    private var logRoot: URL!
+    private var diagnostics: Diagnostics!
     override func setUp() {
         suite = "KeepAwakeTests.\(UUID().uuidString)"
         prefs = UserDefaults(suiteName: suite)!
         backend = FakeDisplayBackend()
         clock = Date()
+        logRoot = FileManager.default.temporaryDirectory.appendingPathComponent("KeepAwakeDisplayTests-\(UUID().uuidString)")
+        var config = Diagnostics.Configuration(); config.directory = logRoot
+        diagnostics = Diagnostics(configuration: config)
         controller = makeController()
     }
     private func makeController() -> BuiltInDisplayController {
-        BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.02, verificationDelay: 0.01, restoreDelay: 0.01, failureRetryDelay: 5, now: { [unowned self] in self.clock })
+        BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.02, verificationDelay: 0.01, restoreDelay: 0.01, failureRetryDelay: 5, now: { [unowned self] in self.clock }, diagnostics: diagnostics)
     }
     override func tearDown() {
         controller.stop()
         prefs.removePersistentDomain(forName: suite)
+        diagnostics.flush()
+        try? FileManager.default.removeItem(at: logRoot)
     }
     private func drain(_ seconds: TimeInterval = 0.09) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
 
+    private func quit() -> Bool {
+        var result: Bool?
+        controller.prepareToQuit { result = $0 }
+        let deadline = Date().addingTimeInterval(1)
+        while result == nil && Date() < deadline { drain(0.01) }
+        return result ?? false
+    }
+    func testLegacyForceOnMigratesToAutomaticOff() {
+        prefs.set(true, forKey: BuiltInDisplayController.Key.automatic)
+        prefs.set(true, forKey: BuiltInDisplayController.Key.forceOn)
+        controller.stop(); controller = makeController()
+        XCTAssertFalse(controller.automatic)
+        XCTAssertNil(prefs.object(forKey: BuiltInDisplayController.Key.forceOn))
+    }
+    func testQuitCompletesInsideNestedMainQueueRunLoop() {
+        controller.setAutomatic(true); drain()
+        let finished = expectation(description: "nested termination loop completes")
+        DispatchQueue.main.async {
+            var result: Bool?
+            self.controller.prepareToQuit { result = $0 }
+            let end = Date().addingTimeInterval(0.5)
+            while result == nil && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+            XCTAssertEqual(result, true)
+            XCTAssertTrue(self.backend.panelOnline)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 1)
+    }
     func testDefaultDoesNotDisable() {
         controller.refresh(); drain()
         XCTAssertTrue(backend.panelOnline)
@@ -90,22 +125,21 @@ final class BuiltInDisplayTests: XCTestCase {
         backend.externalCount = 0; controller.refresh(); drain()
         XCTAssertFalse(backend.calls.contains(false))
     }
-    func testForceOnCancelsPendingDisable() {
+    func testTurningAutomaticOffCancelsPendingDisable() {
         controller.setAutomatic(true)
-        controller.setForceOn(true); drain()
+        controller.setAutomatic(false); drain()
         XCTAssertTrue(backend.panelOnline)
         XCTAssertFalse(backend.calls.contains(false))
     }
-    func testForceOnRestoresAndSurvivesRestartAndHotplug() {
+    func testAutomaticOffRestoresAndSurvivesRestartAndHotplug() {
         controller.setAutomatic(true); drain()
-        controller.setForceOn(true); drain()
+        controller.setAutomatic(false); drain()
         controller.stop(); controller = makeController(); controller.start(); drain()
         backend.externalCount = 0; controller.refresh(); drain()
         backend.externalCount = 1; controller.refresh(); drain()
-        XCTAssertTrue(controller.automatic)
-        XCTAssertTrue(controller.forceOn)
+        XCTAssertFalse(controller.automatic)
         XCTAssertTrue(backend.panelOnline)
-        controller.setForceOn(false); drain()
+        controller.setAutomatic(true); drain()
         XCTAssertFalse(backend.panelOnline)
     }
     func testTurningAutomaticOffRestoresMirror() {
@@ -144,7 +178,7 @@ final class BuiltInDisplayTests: XCTestCase {
     func testRestoreRetriesTransientErrors() {
         controller.setAutomatic(true); drain()
         backend.enableFailures = 2
-        controller.setForceOn(true); drain()
+        controller.setAutomatic(false); drain()
         XCTAssertTrue(backend.panelOnline)
         XCTAssertEqual(backend.calls.filter { $0 }.count, 3)
     }
@@ -157,14 +191,14 @@ final class BuiltInDisplayTests: XCTestCase {
     }
     func testQuitRestoresAndDoesNotErasePreferences() {
         controller.setAutomatic(true); drain()
-        XCTAssertTrue(controller.prepareToQuit())
+        XCTAssertTrue(quit())
         XCTAssertTrue(backend.panelOnline)
         XCTAssertTrue(controller.automatic)
     }
     func testQuitFailureKeepsRecoveryMarker() {
         controller.setAutomatic(true); drain()
         backend.enableFailures = 10
-        XCTAssertFalse(controller.prepareToQuit())
+        XCTAssertFalse(quit())
         XCTAssertTrue(prefs.bool(forKey: BuiltInDisplayController.Key.owned))
     }
     func testNormalWakeCyclesDoNotPermanentlyPauseAfterThreeDisconnects() {
@@ -209,21 +243,21 @@ final class BuiltInDisplayTests: XCTestCase {
     func testExternalUnplugDuringFailureBackoffRestoresImmediately() {
         backend.enableFailures = 3
         controller.setAutomatic(true); drain()
-        controller.setForceOn(true); drain()
+        controller.setAutomatic(false); drain()
         XCTAssertFalse(backend.panelOnline)
         backend.externalCount = 0
         controller.refresh(); drain()
         XCTAssertTrue(backend.panelOnline)
     }
-    func testManualOverrideDuringBackoffCancelsAutomaticRetry() {
+    func testAutomaticOffDuringBackoffCancelsRetry() {
         backend.ignoreDisable = true
         controller.setAutomatic(true); drain()
-        controller.setForceOn(true); drain()
+        controller.setAutomatic(false); drain()
         backend.ignoreDisable = false
         clock = clock.addingTimeInterval(90)
         controller.refresh(); drain()
         XCTAssertTrue(backend.panelOnline)
-        XCTAssertTrue(controller.forceOn)
+        XCTAssertFalse(controller.automatic)
         XCTAssertNil(controller.lastFailure)
     }
     func testEnumerationErrorDuringVerificationDoesNotLeaveControllerStuck() {
@@ -239,7 +273,7 @@ final class BuiltInDisplayTests: XCTestCase {
     }
     func testPollingAutomaticallyRetriesAfterCooldownWithoutManualRefresh() {
         controller.stop()
-        controller = BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.01, verificationDelay: 0.005, restoreDelay: 0.005, failureRetryDelay: 5, pollingInterval: 0.02, now: { [unowned self] in self.clock })
+        controller = BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.01, verificationDelay: 0.005, restoreDelay: 0.005, failureRetryDelay: 5, pollingInterval: 0.02, now: { [unowned self] in self.clock }, diagnostics: diagnostics)
         backend.disableFailures = 1
         controller.start()
         controller.setAutomatic(true); drain()

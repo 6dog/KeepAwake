@@ -16,6 +16,8 @@ struct ManagedDisplay: Equatable {
 
 struct DisplayControlError: LocalizedError {
     let message: String
+    var stage: String = "display"
+    var code: Int32? = nil
     var errorDescription: String? { message }
 }
 
@@ -49,7 +51,7 @@ final class SkyLightDisplayBackend: DisplayBackend {
         while capacity <= 1024 {
             var ids = [UInt32](repeating: 0, count: capacity)
             var count: UInt32 = 0
-            try check(list(UInt32(capacity), &ids, &count))
+            try check(list(UInt32(capacity), &ids, &count), stage: "enumerate")
             if count < capacity {
                 return ids.prefix(Int(count)).compactMap { id in
                     let builtIn = CGDisplayIsBuiltin(id) != 0
@@ -98,10 +100,10 @@ final class SkyLightDisplayBackend: DisplayBackend {
             if !enabled {
                 // Mirroring can be rooted in either screen. Detach every member of this pair.
                 for display in current where display.id == panel.id || display.mirrors == panel.id {
-                    if display.mirrors != 0 { try self.check(CGConfigureDisplayMirrorOfDisplay(config, display.id, 0)) }
+                    if display.mirrors != 0 { try self.check(CGConfigureDisplayMirrorOfDisplay(config, display.id, 0), stage: "unmirror") }
                 }
             }
-            try self.check(set(config, panel.id, enabled))
+            try self.check(set(config, panel.id, enabled), stage: enabled ? "enable" : "disable")
         }
     }
 
@@ -110,19 +112,19 @@ final class SkyLightDisplayBackend: DisplayBackend {
         guard let a = current.first(where: { $0.identity == source && $0.online }),
               let b = current.first(where: { $0.identity == target && $0.online }) else { return }
         if a.mirrors == b.id { return }
-        try transaction { try self.check(CGConfigureDisplayMirrorOfDisplay($0, a.id, b.id)) }
+        try transaction { try self.check(CGConfigureDisplayMirrorOfDisplay($0, a.id, b.id), stage: "restore_mirror") }
     }
 
     private func transaction(_ body: (CGDisplayConfigRef) throws -> Void) throws {
         var config: CGDisplayConfigRef?
-        try check(CGBeginDisplayConfiguration(&config))
+        try check(CGBeginDisplayConfiguration(&config), stage: "begin")
         guard let config else { throw DisplayControlError(message: "无法建立屏幕配置事务") }
         do { try body(config) } catch { CGCancelDisplayConfiguration(config); throw error }
         // Session scoped: do not persist a disabled panel as the login display layout.
-        try check(CGCompleteDisplayConfiguration(config, .forSession))
+        try check(CGCompleteDisplayConfiguration(config, .forSession), stage: "commit")
     }
 
-    private func check(_ error: CGError) throws {
-        if error != .success { throw DisplayControlError(message: "屏幕配置失败（\(error.rawValue)）") }
+    private func check(_ error: CGError, stage: String = "configure") throws {
+        if error != .success { throw DisplayControlError(message: "屏幕配置失败（\(error.rawValue)）", stage: stage, code: error.rawValue) }
     }
 }

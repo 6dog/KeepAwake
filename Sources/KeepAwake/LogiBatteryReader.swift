@@ -119,33 +119,52 @@ final class LogiBatteryReader {
         let status: String?
     }
 
+    private let tokenLock = NSLock()
+    private var currentToken: CancellationToken?
+    private let diagnostics: Diagnostics
+
+    init(diagnostics: Diagnostics = .shared) { self.diagnostics = diagnostics }
+
+    func cancel() { tokenLock.lock(); currentToken?.cancel(); tokenLock.unlock() }
+
     private let queue = DispatchQueue(label: "KeepAwake.LogiBatteryReader", qos: .utility)
 
     func read(completion: @escaping (LogiBatteryStatus) -> Void) {
+        let token = CancellationToken()
+        tokenLock.lock(); currentToken?.cancel(); currentToken = token; tokenLock.unlock()
         queue.async {
-            let status = self.readSynchronously()
+            let status = self.readSynchronously(token: token)
             DispatchQueue.main.async {
                 completion(status)
             }
         }
     }
 
-    private func readSynchronously() -> LogiBatteryStatus {
+    private func readSynchronously(token: CancellationToken) -> LogiBatteryStatus {
+        let operation = UUID().uuidString
+        let started = ProcessInfo.processInfo.systemUptime
+        diagnostics.record("battery", "requested", operation: operation)
         guard let scriptURL = batteryScriptURL() else {
+            diagnostics.record("battery", "script_missing", level: "error", operation: operation)
             return .unavailable("check_logi_battery.py not found")
         }
-
         var failures: [String] = []
         for pythonPath in pythonCandidates() {
-            switch run(scriptURL: scriptURL, pythonPath: pythonPath) {
+            if token.isCancelled { return .unavailable("读取已取消") }
+            let remaining = 20 - (ProcessInfo.processInfo.systemUptime - started)
+            if remaining <= 0 { failures.append("整次读取超时"); break }
+            switch run(scriptURL: scriptURL, pythonPath: pythonPath, timeout: min(10, remaining), token: token, operation: operation) {
             case .success(let status):
+                diagnostics.record("battery", "completed", operation: operation, fields: ["percent": status.percent.map(String.init) ?? "unavailable", "error": status.errorMessage ?? "", "elapsed": String(ProcessInfo.processInfo.systemUptime - started)])
                 return status
             case .failure(let message):
                 failures.append("\((pythonPath as NSString).lastPathComponent): \(message)")
             }
         }
 
-        return .unavailable(failures.isEmpty ? "python3 not found" : failures.joined(separator: "; "))
+        let message = failures.isEmpty ? "python3 not found" : failures.joined(separator: "; ")
+        diagnostics.record("battery", "failed", level: "error", operation: operation, fields: ["message": message])
+        return .unavailable(Diagnostics.sanitize(message))
     }
 
     private func batteryScriptURL() -> URL? {
@@ -200,62 +219,29 @@ final class LogiBatteryReader {
         }
     }
 
-    private func run(scriptURL: URL, pythonPath: String) -> RunResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: pythonPath)
-        process.arguments = [scriptURL.path, "--json"]
-        process.currentDirectoryURL = scriptURL.deletingLastPathComponent()
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            finished.signal()
-        }
-
+    private func run(scriptURL: URL, pythonPath: String, timeout: TimeInterval, token: CancellationToken, operation: String) -> RunResult {
         do {
-            try process.run()
+            diagnostics.record("battery", "candidate", operation: operation, fields: ["python": pythonPath])
+            let result = try CommandRunner().run(executable: URL(fileURLWithPath: pythonPath), arguments: [scriptURL.path, "--json"], directory: scriptURL.deletingLastPathComponent(), timeout: timeout, token: token)
+            diagnostics.record("battery", "process_finished", operation: operation, fields: ["exitCode": String(result.exitCode), "stdoutBytes": String(result.output.count), "stderrBytes": String(result.errorOutput.count), "truncated": String(result.truncated)])
+            guard !result.truncated else { return .failure("电量程序输出过长") }
+            guard result.exitCode == 0 else {
+                let reason = String(data: result.errorOutput, encoding: .utf8)?.split(whereSeparator: \.isNewline).last.map { Diagnostics.sanitize(String($0.prefix(512))) } ?? ""
+                diagnostics.record("battery", "process_error", level: "error", operation: operation, fields: ["exitCode": String(result.exitCode), "reason": reason])
+                return .failure("电量程序退出码 \(result.exitCode)" + (reason.isEmpty ? "" : "：\(reason)"))
+            }
+            do {
+                let payload = try JSONDecoder().decode(Payload.self, from: result.output)
+                guard payload.ok else { return .success(.unavailable(Diagnostics.sanitize(payload.error ?? "receiver not found"))) }
+                guard let percent = payload.percent else { return .success(.unavailable("battery percent missing")) }
+                return .success(.available(percent: percent, deviceStatus: payload.status))
+            } catch {
+                diagnostics.failure("battery", "decode_failed", error, operation: operation)
+                return .failure("电量响应无法解析")
+            }
         } catch {
-            return .failure(error.localizedDescription)
-        }
-
-        if finished.wait(timeout: .now() + .seconds(10)) == .timedOut {
-            process.terminate()
-            if finished.wait(timeout: .now() + .seconds(2)) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
-                _ = finished.wait(timeout: .now() + .seconds(1))
-            }
-            return .failure("timed out")
-        }
-
-        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
-        let stderrText = String(data: stderrData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard process.terminationStatus == 0 else {
-            return .failure(stderrText?.isEmpty == false ? stderrText! : "exit \(process.terminationStatus)")
-        }
-
-        do {
-            let payload = try JSONDecoder().decode(Payload.self, from: stdoutData)
-            guard payload.ok else {
-                return .success(.unavailable(payload.error ?? "receiver not found"))
-            }
-            guard let percent = payload.percent else {
-                return .success(.unavailable("battery percent missing"))
-            }
-            return .success(.available(
-                percent: percent,
-                deviceStatus: payload.status
-            ))
-        } catch {
-            let stdoutText = String(data: stdoutData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return .failure(stdoutText?.isEmpty == false ? stdoutText! : error.localizedDescription)
+            diagnostics.failure("battery", "process_failed", error, operation: operation)
+            return .failure(Diagnostics.sanitize(error.localizedDescription))
         }
     }
 }
