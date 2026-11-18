@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 final class BuiltInDisplayController {
     enum Key {
@@ -12,14 +13,22 @@ final class BuiltInDisplayController {
     private let delay: TimeInterval
     private let verificationDelay: TimeInterval
     private let restoreDelay: TimeInterval
+    private let pollingInterval: TimeInterval
     private var changing = false
     private var work: DispatchWorkItem?
     private var retry: DispatchWorkItem?
     private var observers: [NSObjectProtocol] = []
     private var timer: Timer?
     private var generation = 0
-    private var disableAttempts: [Date] = []
-    private var paused = false
+    private let failureRetryDelay: TimeInterval
+    private let now: () -> Date
+    private let logger = Logger(subsystem: "com.jesseyun.KeepAwake", category: "DisplayControl")
+    private var failureCount = 0
+    private var recentClosures: [Date] = []
+    private var retryAfter: Date?
+    private var mustRecover = false
+    private var verifyingDisable = false
+    private(set) var lastFailure: String?
     private var recovering = false
     private var stopping = false
     private(set) var status = "内置屏幕：正在检测"
@@ -32,12 +41,15 @@ final class BuiltInDisplayController {
         set { defaults.set(newValue, forKey: Key.owned) }
     }
 
-    init(backend: DisplayBackend = SkyLightDisplayBackend(), defaults: UserDefaults = .standard, delay: TimeInterval = 2, verificationDelay: TimeInterval = 0.6, restoreDelay: TimeInterval = 0.4) {
+    init(backend: DisplayBackend = SkyLightDisplayBackend(), defaults: UserDefaults = .standard, delay: TimeInterval = 2, verificationDelay: TimeInterval = 0.6, restoreDelay: TimeInterval = 0.4, failureRetryDelay: TimeInterval = 5, pollingInterval: TimeInterval = 3, now: @escaping () -> Date = Date.init) {
         self.backend = backend
         self.defaults = defaults
         self.delay = delay
         self.verificationDelay = verificationDelay
         self.restoreDelay = restoreDelay
+        self.failureRetryDelay = failureRetryDelay
+        self.pollingInterval = pollingInterval
+        self.now = now
     }
 
     func start() {
@@ -46,22 +58,24 @@ final class BuiltInDisplayController {
             observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refresh() })
         }
         // Fallback if a hotplug notification is lost; also refreshes actual menu state.
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
-        if owned { restore(attempt: 0, resumeAutomation: true) } else { refresh() }
+        let pollTimer = Timer(timeInterval: pollingInterval, repeats: true) { [weak self] _ in self?.refresh() }
+        timer = pollTimer
+        RunLoop.main.add(pollTimer, forMode: .common)
+        if owned { restore(attempt: 0) } else { refresh() }
     }
 
     func setAutomatic(_ enabled: Bool) {
         defaults.set(enabled, forKey: Key.automatic)
-        paused = false
-        disableAttempts.removeAll()
+        resetFailures()
+        recentClosures.removeAll()
         cancelPending()
         if !enabled && owned { restore(attempt: 0) } else { refresh() }
     }
 
     func setForceOn(_ enabled: Bool) {
         defaults.set(enabled, forKey: Key.forceOn)
-        paused = false
-        disableAttempts.removeAll()
+        resetFailures()
+        recentClosures.removeAll()
         cancelPending()
         if enabled { restore(attempt: 0) } else { refresh() }
     }
@@ -71,6 +85,26 @@ final class BuiltInDisplayController {
         work?.cancel(); work = nil
         retry?.cancel(); retry = nil
         recovering = false
+        verifyingDisable = false
+    }
+
+    private func resetFailures() {
+        failureCount = 0
+        retryAfter = nil
+        lastFailure = nil
+    }
+
+    private var retrySeconds: Int {
+        guard let retryAfter else { return 0 }
+        return max(0, Int(ceil(retryAfter.timeIntervalSince(now()))))
+    }
+
+    private func recordFailure(_ error: Error) {
+        failureCount += 1
+        lastFailure = error.localizedDescription
+        let interval = min(60, failureRetryDelay * pow(2, Double(min(failureCount - 1, 4))))
+        retryAfter = now().addingTimeInterval(interval)
+        logger.error("Screen control failed; retry in \(interval, privacy: .public)s: \(error.localizedDescription, privacy: .public)")
     }
 
     func refresh() {
@@ -80,49 +114,67 @@ final class BuiltInDisplayController {
             available = true
             let panel = screens.first(where: \.builtIn)
             let hasExternal = screens.contains(where: \.usableExternal)
-            if ((forceOn || !automatic || !hasExternal || paused) && owned) || (forceOn && panel?.online == false) {
+            let wantsRestore = forceOn || !automatic || !hasExternal || mustRecover
+            if wantsRestore && (owned || (forceOn && panel?.online == false)) {
                 work?.cancel(); work = nil
-                restore(attempt: 0)
+                verifyingDisable = false
+                if retrySeconds > 0 && (hasExternal || panel?.online == true) {
+                    status = "内置屏幕恢复待重试（\(retrySeconds) 秒后）"
+                    onChange?()
+                } else { restore(attempt: 0) }
                 return
             }
+            if verifyingDisable { return }
             if panel?.online == true {
-                status = paused ? "内置屏幕已开启（自动控制已暂停）" : "内置屏幕已开启"
-                if automatic && !forceOn && hasExternal && !paused && work == nil {
-                    let token = generation
-                    let item = DispatchWorkItem { [weak self] in
-                        guard let self, self.generation == token else { return }
-                        self.work = nil
-                        self.disableIfSafe()
+                if automatic && !forceOn && hasExternal {
+                    if retrySeconds > 0 {
+                        status = "内置屏幕已开启（\(retrySeconds) 秒后自动重试）"
+                    } else {
+                        status = "内置屏幕已开启（等待外接屏稳定）"
+                        if work == nil {
+                            let token = generation
+                            let item = DispatchWorkItem { [weak self] in
+                                guard let self, self.generation == token else { return }
+                                self.work = nil
+                                self.disableIfSafe()
+                            }
+                            work = item
+                            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+                        }
                     }
-                    work = item
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+                } else {
+                    status = forceOn ? "内置屏幕已开启（保持开启）" : "内置屏幕已开启"
                 }
             } else {
                 status = panel == nil ? "未检测到内置屏幕（请保持开盖）" : "内置屏幕已关闭"
             }
-            if !hasExternal || forceOn || !automatic || paused { work?.cancel(); work = nil }
+            if !hasExternal || forceOn || !automatic { work?.cancel(); work = nil }
             onChange?()
         } catch {
             work?.cancel(); work = nil
+            if verifyingDisable { mustRecover = owned }
+            verifyingDisable = false
             available = false
+            if lastFailure != error.localizedDescription { recordFailure(error) }
             status = "屏幕控制不可用：\(error.localizedDescription)"
             onChange?()
         }
     }
 
     private func disableIfSafe() {
-        guard !stopping, automatic, !forceOn, !paused else { return }
+        guard !stopping, automatic, !forceOn, !mustRecover, retrySeconds == 0 else { return }
         do {
             let screens = try backend.displays()
             guard screens.contains(where: \.usableExternal), let panel = screens.first(where: \.builtIn), panel.online else { refresh(); return }
-            disableAttempts = disableAttempts.filter { Date().timeIntervalSince($0) < 60 }
-            guard disableAttempts.count < 3 else {
-                paused = true
-                status = "自动控制已暂停：屏幕反复恢复，请重新开关自动功能"
+            recentClosures = recentClosures.filter { now().timeIntervalSince($0) < 15 }
+            if recentClosures.count >= 3 {
+                // Limit rapid WindowServer re-enable loops, without leaving automation paused forever.
+                recordFailure(DisplayControlError(message: "系统短时间内反复重新启用内置屏幕"))
+                recentClosures.removeAll()
+                status = "内置屏幕已开启（\(retrySeconds) 秒后自动重试）"
                 onChange?()
                 return
             }
-            disableAttempts.append(Date())
             if !owned {
                 let relations = screens.compactMap { display -> [String]? in
                     guard display.id == panel.id || display.mirrors == panel.id,
@@ -136,34 +188,60 @@ final class BuiltInDisplayController {
             changing = true
             defer { changing = false }
             try backend.setBuiltInEnabled(false)
-            let token = generation
-            let verification = DispatchWorkItem { [weak self] in
-                guard let self, self.generation == token else { return }
-                self.work = nil
-                do {
-                    if try self.backend.displays().first(where: \.builtIn)?.online != false {
-                        throw DisplayControlError(message: "内置屏幕未关闭，自动控制已暂停")
-                    }
-                    self.refresh()
-                } catch { self.failAndRecover(error) }
-            }
-            work = verification
+            verifyingDisable = true
             status = "内置屏幕：正在关闭"
             onChange?()
-            DispatchQueue.main.asyncAfter(deadline: .now() + verificationDelay, execute: verification)
+            verifyDisable(attempt: 0)
         } catch { failAndRecover(error) }
     }
 
+    private func verifyDisable(attempt: Int) {
+        let token = generation
+        let verification = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == token, !self.stopping else { return }
+            self.work = nil
+            do {
+                let screens = try self.backend.displays()
+                guard self.automatic, !self.forceOn, screens.contains(where: \.usableExternal) else {
+                    self.verifyingDisable = false
+                    self.restore(attempt: 0)
+                    return
+                }
+                if screens.first(where: \.builtIn)?.online == false {
+                    self.verifyingDisable = false
+                    self.resetFailures()
+                    self.recentClosures.append(self.now())
+                    self.logger.info("Built-in display disabled and verified")
+                    self.refresh()
+                } else if attempt < 4 {
+                    // WindowServer may need several frames/transactions to finish reconfiguration.
+                    // Poll the result; do not submit another disable transaction while it settles.
+                    self.verifyDisable(attempt: attempt + 1)
+                } else {
+                    throw DisplayControlError(message: "系统尚未关闭内置屏幕")
+                }
+            } catch { self.failAndRecover(error) }
+        }
+        work = verification
+        DispatchQueue.main.asyncAfter(deadline: .now() + verificationDelay, execute: verification)
+    }
+
     private func failAndRecover(_ error: Error) {
-        paused = true
-        status = "屏幕操作失败：\(error.localizedDescription)"
+        verifyingDisable = false
+        recordFailure(error)
+        mustRecover = owned
+        status = "关闭失败，将自动重试：\(error.localizedDescription)"
         onChange?()
         if owned { restore(attempt: 0) }
     }
 
-    private func restore(attempt: Int, resumeAutomation: Bool = false) {
+    private func restore(attempt: Int) {
+        generation += 1
         work?.cancel(); work = nil
+        retry?.cancel(); retry = nil
+        verifyingDisable = false
         recovering = true
+        mustRecover = true
         status = "内置屏幕：正在恢复"
         onChange?()
         var failure: Error?
@@ -181,15 +259,17 @@ final class BuiltInDisplayController {
                 try self.finishRestore()
                 self.recovering = false
                 self.retry = nil
-                self.status = self.paused ? "内置屏幕已恢复（自动控制已暂停）" : "内置屏幕已开启"
+                self.mustRecover = false
+                self.status = "内置屏幕已开启"
+                self.logger.info("Built-in display restored and verified")
                 self.onChange?()
-                if resumeAutomation { self.refresh() }
+                self.refresh()
             } catch {
-                if attempt < 2 { self.restore(attempt: attempt + 1, resumeAutomation: resumeAutomation) }
+                if attempt < 2 { self.restore(attempt: attempt + 1) }
                 else {
                     self.recovering = false
-                    self.paused = true
-                    self.status = "恢复失败：\(error.localizedDescription)；可重开上盖或拔插外接屏后重试"
+                    self.recordFailure(error)
+                    self.status = "恢复失败（\(self.retrySeconds) 秒后重试）：\(error.localizedDescription)"
                     self.onChange?()
                     // Keep the recovery marker. A later hotplug/poll or restart can recover.
                 }
@@ -226,7 +306,8 @@ final class BuiltInDisplayController {
             }
             throw lastError
         } catch {
-            paused = true
+            mustRecover = true
+            recordFailure(error)
             status = "退出已取消：\(error.localizedDescription)，请先恢复内置屏幕"
             onChange?()
             return false

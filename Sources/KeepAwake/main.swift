@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let builtInDisplay = BuiltInDisplayController()
     private let builtInStatusItem = NSMenuItem()
+    private let builtInErrorItem = NSMenuItem()
     private let autoBuiltInItem = NSMenuItem()
     private let forceBuiltInItem = NSMenuItem()
     private let menu = NSMenu()
@@ -80,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func configureMenu() {
         menu.delegate = self
+        menu.autoenablesItems = false
 
         batteryStatusItem.isEnabled = false
         menu.addItem(batteryStatusItem)
@@ -104,6 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         builtInStatusItem.isEnabled = false
         menu.addItem(builtInStatusItem)
+        builtInErrorItem.isEnabled = false
+        menu.addItem(builtInErrorItem)
         autoBuiltInItem.title = "外接显示器时自动关闭内置屏幕"
         autoBuiltInItem.target = self
         autoBuiltInItem.action = #selector(toggleAutoBuiltIn)
@@ -158,6 +162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         systemAwakeItem.state = isPreventingSystemSleep ? .on : .off
 
         builtInStatusItem.title = builtInDisplay.status
+        builtInErrorItem.isHidden = builtInDisplay.lastFailure == nil
+        builtInErrorItem.title = builtInDisplay.lastFailure.map { "上次原因：\($0)" } ?? ""
         autoBuiltInItem.state = builtInDisplay.automatic ? .on : .off
         autoBuiltInItem.isEnabled = builtInDisplay.available || builtInDisplay.automatic
         forceBuiltInItem.state = builtInDisplay.forceOn ? .on : .off

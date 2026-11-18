@@ -9,11 +9,18 @@ private final class FakeDisplayBackend: DisplayBackend {
     var mirror = true
     var failEnumeration = false
     var ignoreDisable = false
+    var disableFailures = 0
+    var delayedDisablePolls = 0
+    private var pendingDisablePolls = 0
     var enableFailures = 0
     var calls: [Bool] = []
     var restoredMirrors = 0
     func displays() throws -> [ManagedDisplay] {
         if failEnumeration { throw DisplayControlError(message: "missing symbol") }
+        if pendingDisablePolls > 0 {
+            pendingDisablePolls -= 1
+            if pendingDisablePolls == 0 { panelOnline = false }
+        }
         return [ManagedDisplay(id: panelID, identity: "internal", builtIn: true, online: panelOnline, active: panelOnline, physical: true, mirrors: mirror ? 10 : 0)] + (0..<externalCount).map {
             ManagedDisplay(id: UInt32(10 + $0), identity: "external\($0)", builtIn: false, online: true, active: true, physical: externalPhysical, mirrors: 0)
         }
@@ -21,7 +28,12 @@ private final class FakeDisplayBackend: DisplayBackend {
     func setBuiltInEnabled(_ enabled: Bool) throws {
         calls.append(enabled)
         if enabled && enableFailures > 0 { enableFailures -= 1; throw DisplayControlError(message: "temporary") }
-        if enabled || !ignoreDisable { panelOnline = enabled }
+        if !enabled && disableFailures > 0 { disableFailures -= 1; throw DisplayControlError(message: "temporary disable error") }
+        if enabled { pendingDisablePolls = 0; panelOnline = true }
+        else if !ignoreDisable {
+            if delayedDisablePolls > 0 { pendingDisablePolls = delayedDisablePolls }
+            else { panelOnline = false }
+        }
         if !enabled { mirror = false }
     }
     func restoreMirror(_ source: String, to target: String) throws { restoredMirrors += 1; mirror = true }
@@ -32,14 +44,16 @@ final class BuiltInDisplayTests: XCTestCase {
     private var prefs: UserDefaults!
     private var backend: FakeDisplayBackend!
     private var controller: BuiltInDisplayController!
+    private var clock: Date!
     override func setUp() {
         suite = "KeepAwakeTests.\(UUID().uuidString)"
         prefs = UserDefaults(suiteName: suite)!
         backend = FakeDisplayBackend()
+        clock = Date()
         controller = makeController()
     }
     private func makeController() -> BuiltInDisplayController {
-        BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.02, verificationDelay: 0.01, restoreDelay: 0.01)
+        BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.02, verificationDelay: 0.01, restoreDelay: 0.01, failureRetryDelay: 5, now: { [unowned self] in self.clock })
     }
     override func tearDown() {
         controller.stop()
@@ -113,12 +127,19 @@ final class BuiltInDisplayTests: XCTestCase {
         XCTAssertTrue(backend.calls.isEmpty)
         XCTAssertTrue(controller.status.contains("missing symbol"))
     }
-    func testFalseSuccessPausesAutomaticControlAndRestores() {
+    func testFalseSuccessRestoresAndAutomaticallyRetries() {
         backend.ignoreDisable = true
         controller.setAutomatic(true); drain()
         controller.refresh(); drain()
         XCTAssertEqual(backend.calls.filter { !$0 }.count, 1)
         XCTAssertTrue(backend.panelOnline)
+        XCTAssertNotNil(controller.lastFailure)
+        XCTAssertTrue(controller.status.contains("自动重试"))
+        backend.ignoreDisable = false
+        clock = clock.addingTimeInterval(6)
+        controller.refresh(); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertNil(controller.lastFailure)
     }
     func testRestoreRetriesTransientErrors() {
         controller.setAutomatic(true); drain()
@@ -146,11 +167,89 @@ final class BuiltInDisplayTests: XCTestCase {
         XCTAssertFalse(controller.prepareToQuit())
         XCTAssertTrue(prefs.bool(forKey: BuiltInDisplayController.Key.owned))
     }
-    func testRepeatedWakeStopsAfterThreeDisconnects() {
+    func testNormalWakeCyclesDoNotPermanentlyPauseAfterThreeDisconnects() {
         controller.setAutomatic(true); drain()
-        for _ in 0..<4 { backend.panelOnline = true; controller.refresh(); drain() }
-        XCTAssertEqual(backend.calls.filter { !$0 }.count, 3)
+        // Four wakes within the old one-minute window used to permanently pause the app.
+        for _ in 0..<4 {
+            clock = clock.addingTimeInterval(10)
+            backend.panelOnline = true; controller.refresh(); drain()
+            XCTAssertFalse(backend.panelOnline)
+        }
+        XCTAssertEqual(backend.calls.filter { !$0 }.count, 5)
+        XCTAssertNil(controller.lastFailure)
+    }
+    func testRapidReenableLoopIsThrottledAndAutomaticallyResumes() {
+        controller.setAutomatic(true); drain()
+        for _ in 0..<3 { backend.panelOnline = true; controller.refresh(); drain() }
         XCTAssertTrue(backend.panelOnline)
+        XCTAssertEqual(backend.calls.filter { !$0 }.count, 3)
+        XCTAssertTrue(controller.status.contains("自动重试"))
+        clock = clock.addingTimeInterval(6)
+        controller.refresh(); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertNil(controller.lastFailure)
+    }
+    func testSlowWindowServerResultIsPolledWithoutResubmitting() {
+        backend.delayedDisablePolls = 4
+        controller.setAutomatic(true); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertEqual(backend.calls, [false])
+        XCTAssertNil(controller.lastFailure)
+    }
+    func testTransientDisableErrorRecoversWithoutManualToggle() {
+        backend.disableFailures = 1
+        controller.setAutomatic(true); drain()
+        XCTAssertTrue(controller.status.contains("自动重试"))
+        XCTAssertTrue(controller.lastFailure?.contains("temporary disable error") == true)
+        clock = clock.addingTimeInterval(6)
+        controller.refresh(); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertNil(controller.lastFailure)
+    }
+    func testExternalUnplugDuringFailureBackoffRestoresImmediately() {
+        backend.enableFailures = 3
+        controller.setAutomatic(true); drain()
+        controller.setForceOn(true); drain()
+        XCTAssertFalse(backend.panelOnline)
+        backend.externalCount = 0
+        controller.refresh(); drain()
+        XCTAssertTrue(backend.panelOnline)
+    }
+    func testManualOverrideDuringBackoffCancelsAutomaticRetry() {
+        backend.ignoreDisable = true
+        controller.setAutomatic(true); drain()
+        controller.setForceOn(true); drain()
+        backend.ignoreDisable = false
+        clock = clock.addingTimeInterval(90)
+        controller.refresh(); drain()
+        XCTAssertTrue(backend.panelOnline)
+        XCTAssertTrue(controller.forceOn)
+        XCTAssertNil(controller.lastFailure)
+    }
+    func testEnumerationErrorDuringVerificationDoesNotLeaveControllerStuck() {
+        controller.setAutomatic(true)
+        drain(0.025)
+        backend.failEnumeration = true
+        controller.refresh()
+        backend.failEnumeration = false
+        clock = clock.addingTimeInterval(6)
+        controller.refresh(); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertNil(controller.lastFailure)
+    }
+    func testPollingAutomaticallyRetriesAfterCooldownWithoutManualRefresh() {
+        controller.stop()
+        controller = BuiltInDisplayController(backend: backend, defaults: prefs, delay: 0.01, verificationDelay: 0.005, restoreDelay: 0.005, failureRetryDelay: 5, pollingInterval: 0.02, now: { [unowned self] in self.clock })
+        backend.disableFailures = 1
+        controller.start()
+        controller.setAutomatic(true); drain()
+        XCTAssertTrue(backend.panelOnline)
+        XCTAssertNotNil(controller.lastFailure)
+        backend.disableFailures = 0
+        clock = clock.addingTimeInterval(6)
+        drain() // Only the running poll timer can restart automation here.
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertNil(controller.lastFailure)
     }
     func testPhysicalClassifierFailsClosedForAirPlayVirtualAndMissingData() {
         let physical: NSDictionary = ["kCGDisplayIsVirtualDevice": false, "kCGDisplayIsAirPlay": false, "IODisplayLocation": "IOService:/dispext0/AppleCLCD2"]
