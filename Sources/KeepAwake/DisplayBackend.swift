@@ -10,8 +10,11 @@ struct ManagedDisplay: Equatable {
     let active: Bool
     let physical: Bool
     let mirrors: CGDirectDisplayID
+    var main = false
+    var origin: CGPoint = .zero
 
-    var usableExternal: Bool { !builtIn && online && physical && (active || mirrors != 0) }
+    var connectedExternal: Bool { !builtIn && online && physical }
+    var usableExternal: Bool { connectedExternal && (active || mirrors != 0) }
 }
 
 struct DisplayControlError: LocalizedError {
@@ -25,6 +28,22 @@ protocol DisplayBackend {
     func displays() throws -> [ManagedDisplay]
     func setBuiltInEnabled(_ enabled: Bool) throws
     func restoreMirror(_ source: String, to target: String) throws
+    func preserveExternalMain() throws
+}
+
+/// Rebase the active desktop as a whole so making a screen main preserves relative placement.
+struct ExternalMainLayout {
+    static func target(in screens: [ManagedDisplay], preferred: String?) -> ManagedDisplay? {
+        let candidates = screens.filter { $0.usableExternal && $0.active && $0.mirrors == 0 }
+        return candidates.first(where: \.main)
+            ?? candidates.first(where: { $0.identity == preferred })
+            ?? candidates.min(by: { $0.id < $1.id })
+    }
+    static func origins(in screens: [ManagedDisplay], target: ManagedDisplay) -> [(CGDirectDisplayID, CGPoint)] {
+        screens.filter { $0.online && $0.active && $0.mirrors == 0 }.map {
+            ($0.id, CGPoint(x: $0.origin.x - target.origin.x, y: $0.origin.y - target.origin.y))
+        }
+    }
 }
 
 /// A software-disabled panel can disappear from even SkyLight after the last cable is removed.
@@ -62,6 +81,8 @@ final class SkyLightDisplayBackend: DisplayBackend {
     private typealias Info = @convention(c) (UInt32) -> Unmanaged<CFDictionary>?
     private let target: BuiltInDisplayTarget
     private let diagnostics: Diagnostics
+    private let defaults: UserDefaults
+    private let mainKey = "preferredExternalMainDisplay"
     init(defaults: UserDefaults = .standard, diagnostics: Diagnostics = .shared) {
         var size = 0
         var boot: String?
@@ -73,6 +94,7 @@ final class SkyLightDisplayBackend: DisplayBackend {
         }
         target = BuiltInDisplayTarget(defaults: defaults, boot: boot)
         self.diagnostics = diagnostics
+        self.defaults = defaults
     }
     private let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
     private let core = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay", RTLD_LAZY)
@@ -106,8 +128,12 @@ final class SkyLightDisplayBackend: DisplayBackend {
                     return ManagedDisplay(
                         id: id, identity: identity, builtIn: builtIn,
                         online: CGDisplayIsOnline(id) != 0, active: CGDisplayIsActive(id) != 0,
-                        physical: builtIn || Self.isPhysical(dictionary), mirrors: CGDisplayMirrorsDisplay(id)
+                        physical: builtIn || Self.isPhysical(dictionary), mirrors: CGDisplayMirrorsDisplay(id),
+                        main: CGDisplayIsMain(id) != 0, origin: CGDisplayBounds(id).origin
                     )
+                }
+                if let main = screens.first(where: { $0.usableExternal && $0.main }) {
+                    if defaults.string(forKey: mainKey) != main.identity { defaults.set(main.identity, forKey: mainKey) }
                 }
                 _ = target.resolve(in: screens, restoring: false)
                 return screens
@@ -160,6 +186,27 @@ final class SkyLightDisplayBackend: DisplayBackend {
               let b = current.first(where: { $0.identity == target && $0.online }) else { return }
         if a.mirrors == b.id { return }
         try transaction { try self.check(CGConfigureDisplayMirrorOfDisplay($0, a.id, b.id), stage: "restore_mirror") }
+    }
+
+    func preserveExternalMain() throws {
+        let current = try displays()
+        guard let chosen = ExternalMainLayout.target(in: current, preferred: defaults.string(forKey: mainKey)) else { return }
+        if defaults.string(forKey: mainKey) != chosen.identity { defaults.set(chosen.identity, forKey: mainKey) }
+        guard !chosen.main else { return }
+        let origins = ExternalMainLayout.origins(in: current, target: chosen)
+        diagnostics.record("display", "external_main_started", fields: ["target": String(chosen.id), "previous": current.first(where: \.main).map { String($0.id) } ?? "none"])
+        try transaction { config in
+            // Move the previous main away first, then place the chosen external at the origin.
+            for (id, point) in origins.sorted(by: { ($0.0 == chosen.id ? 1 : 0) < ($1.0 == chosen.id ? 1 : 0) }) {
+                guard point.x >= CGFloat(Int32.min), point.x <= CGFloat(Int32.max),
+                      point.y >= CGFloat(Int32.min), point.y <= CGFloat(Int32.max) else {
+                    throw DisplayControlError(message: "屏幕布局超出可用范围", stage: "main_origin")
+                }
+                try self.check(CGConfigureDisplayOrigin(config, id, Int32(point.x), Int32(point.y)), stage: "main_origin")
+            }
+        }
+        diagnostics.record("display", "external_main_submitted", fields: ["target": String(chosen.id)])
+        // Actual main/origin values are included in subsequent topology snapshots.
     }
 
     private func transaction(_ body: (CGDisplayConfigRef) throws -> Void) throws {

@@ -5,6 +5,8 @@ private final class FakeDisplayBackend: DisplayBackend {
     var panelOnline = true
     var externalCount = 1
     var externalPhysical = true
+    var externalActive = true
+    var mainRequests = 0
     var panelID: UInt32 = 1
     var mirror = true
     var failEnumeration = false
@@ -22,7 +24,7 @@ private final class FakeDisplayBackend: DisplayBackend {
             if pendingDisablePolls == 0 { panelOnline = false }
         }
         return [ManagedDisplay(id: panelID, identity: "internal", builtIn: true, online: panelOnline, active: panelOnline, physical: true, mirrors: mirror ? 10 : 0)] + (0..<externalCount).map {
-            ManagedDisplay(id: UInt32(10 + $0), identity: "external\($0)", builtIn: false, online: true, active: true, physical: externalPhysical, mirrors: 0)
+            ManagedDisplay(id: UInt32(10 + $0), identity: "external\($0)", builtIn: false, online: true, active: externalActive, physical: externalPhysical, mirrors: 0)
         }
     }
     func setBuiltInEnabled(_ enabled: Bool) throws {
@@ -36,6 +38,7 @@ private final class FakeDisplayBackend: DisplayBackend {
         }
         if !enabled { mirror = false }
     }
+    func preserveExternalMain() throws { mainRequests += 1 }
     func restoreMirror(_ source: String, to target: String) throws { restoredMirrors += 1; mirror = true }
 }
 
@@ -123,6 +126,61 @@ final class BuiltInDisplayTests: XCTestCase {
         controller.refresh(); drain()
         XCTAssertTrue(backend.panelOnline)
         XCTAssertFalse(prefs.bool(forKey: BuiltInDisplayController.Key.owned))
+    }
+    func testSleepingConnectedExternalDoesNotRestoreInternalPanel() {
+        controller.setAutomatic(true); drain()
+        backend.externalActive = false
+        controller.refresh(); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertEqual(backend.calls, [false])
+        backend.externalActive = true
+        controller.refresh(); drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertEqual(backend.calls, [false])
+        backend.externalCount = 0
+        controller.refresh(); drain()
+        XCTAssertTrue(backend.panelOnline)
+    }
+    func testSleepingExternalDoesNotCauseRestoreDuringDisableVerification() {
+        controller.setAutomatic(true); drain(0.025)
+        backend.externalActive = false
+        drain()
+        XCTAssertFalse(backend.panelOnline)
+        XCTAssertEqual(backend.calls, [false])
+    }
+    func testAutomaticRequestsExternalMainAfterReconnectButManualModeDoesNot() {
+        controller.setAutomatic(true); drain()
+        let before = backend.mainRequests
+        backend.externalCount = 0; controller.refresh(); drain()
+        backend.externalCount = 1; controller.refresh(); drain()
+        XCTAssertGreaterThan(backend.mainRequests, before)
+        controller.setAutomatic(false); drain()
+        let manual = backend.mainRequests
+        controller.refresh(); drain()
+        XCTAssertEqual(backend.mainRequests, manual)
+    }
+    func testTurningAutomaticOffAlsoPreservesExternalMainDuringRestore() {
+        controller.setAutomatic(true); drain()
+        let before = backend.mainRequests
+        controller.setAutomatic(false); drain()
+        XCTAssertTrue(backend.panelOnline)
+        XCTAssertGreaterThan(backend.mainRequests, before)
+    }
+    func testExternalMainRebasesDesktopWithoutChangingRelativeLayout() {
+        let panel = ManagedDisplay(id: 1, identity: "internal", builtIn: true, online: true, active: true, physical: true, mirrors: 0, main: true, origin: .zero)
+        let a = ManagedDisplay(id: 10, identity: "a", builtIn: false, online: true, active: true, physical: true, mirrors: 0, origin: CGPoint(x: 1512, y: -100))
+        let b = ManagedDisplay(id: 11, identity: "b", builtIn: false, online: true, active: true, physical: true, mirrors: 0, origin: CGPoint(x: 3432, y: -100))
+        XCTAssertEqual(ExternalMainLayout.target(in: [panel, a, b], preferred: "b")?.id, 11)
+        let positions = Dictionary(uniqueKeysWithValues: ExternalMainLayout.origins(in: [panel, a, b], target: a))
+        XCTAssertEqual(positions[10], .zero)
+        XCTAssertEqual(positions[1], CGPoint(x: -1512, y: 100))
+        XCTAssertEqual(positions[11], CGPoint(x: 1920, y: 0))
+        var primary = b; primary.main = true
+        XCTAssertEqual(ExternalMainLayout.target(in: [panel, a, primary], preferred: "a")?.id, 11)
+        var virtual = a; virtual = ManagedDisplay(id: virtual.id, identity: virtual.identity, builtIn: false, online: true, active: true, physical: false, mirrors: 0)
+        XCTAssertNil(ExternalMainLayout.target(in: [panel, virtual], preferred: nil))
+        var sleeping = b; sleeping = ManagedDisplay(id: sleeping.id, identity: sleeping.identity, builtIn: false, online: true, active: false, physical: true, mirrors: 0)
+        XCTAssertNil(ExternalMainLayout.target(in: [panel, sleeping], preferred: nil))
     }
     func testOneOfMultipleExternalDisplaysCanRemain() {
         backend.externalCount = 2

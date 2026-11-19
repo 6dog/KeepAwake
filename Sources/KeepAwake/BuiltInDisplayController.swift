@@ -29,7 +29,7 @@ final class BuiltInDisplayController {
     var isBusy: Bool { changing || recovering || verifyingDisable || quitting }
     var snapshot: [String: String] {
         ["automatic": String(automatic), "owned": String(owned), "status": status, "error": lastFailure ?? "", "retrySeconds": String(retrySeconds),
-         "screens": cachedScreens.map { "id=\($0.id),builtin=\($0.builtIn),online=\($0.online),active=\($0.active),physical=\($0.physical),mirror=\($0.mirrors)" }.joined(separator: ";")]
+         "screens": cachedScreens.map { "id=\($0.id),builtin=\($0.builtIn),online=\($0.online),active=\($0.active),physical=\($0.physical),mirror=\($0.mirrors),main=\($0.main),origin=\($0.origin.x):\($0.origin.y)" }.joined(separator: ";")]
     }
     private var failureCount = 0
     private var recentClosures: [TimeInterval] = []
@@ -144,7 +144,8 @@ final class BuiltInDisplayController {
             }
             diagnostics.record("display", "decision", level: "debug", operation: operation, fields: snapshot.merging(["trigger": trigger]) { _, new in new })
             let panel = screens.first(where: \.builtIn)
-            let hasExternal = screens.contains(where: \.usableExternal)
+            let hasExternal = screens.contains(where: \.connectedExternal)
+            if automatic && screens.contains(where: \.usableExternal) { preserveExternalMain() }
             let wantsRestore = !automatic || !hasExternal || mustRecover
             if wantsRestore && owned {
                 work?.cancel(); work = nil
@@ -157,7 +158,7 @@ final class BuiltInDisplayController {
             }
             if verifyingDisable { return }
             if panel?.online == true {
-                if automatic && hasExternal {
+                if automatic && screens.contains(where: \.usableExternal) {
                     if retrySeconds > 0 {
                         status = "内置屏幕已开启（\(retrySeconds) 秒后自动重试）"
                     } else {
@@ -238,7 +239,7 @@ final class BuiltInDisplayController {
             do {
                 let screens = try self.backend.displays()
                 self.cachedScreens = screens
-                guard self.automatic, screens.contains(where: \.usableExternal) else {
+                guard self.automatic, screens.contains(where: \.connectedExternal) else {
                     self.verifyingDisable = false
                     self.restore(attempt: 0)
                     return
@@ -318,10 +319,18 @@ final class BuiltInDisplayController {
         schedule(item, after: restoreDelay)
     }
 
+    private func preserveExternalMain() {
+        changing = true
+        defer { changing = false }
+        do { try backend.preserveExternalMain() }
+        catch { diagnostics.failure("display", "external_main_failed", error, operation: operation) }
+    }
+
     private func finishRestore() throws {
         if let relations = defaults.array(forKey: Key.mirrors) as? [[String]] {
             for pair in relations where pair.count == 2 { try backend.restoreMirror(pair[0], to: pair[1]) }
         }
+        preserveExternalMain()
         owned = false
         defaults.removeObject(forKey: Key.mirrors)
     }
