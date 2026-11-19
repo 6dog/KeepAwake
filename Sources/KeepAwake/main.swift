@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 import Darwin
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -46,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         state.chooseAutomatic = { [weak self] enabled in self?.display.setAutomatic(enabled); self?.synchronize() }
         state.refreshBattery = { [weak self] in self?.readBattery(trigger: "user") }
+        state.quit = { [weak self] in self?.quit() }
         display.onChange = { [weak self] in self?.synchronize() }
         configurePanel()
         power.apply(PowerMode.saved(in: .standard, diagnostics: diagnostics), persist: false, trigger: "startup")
@@ -70,30 +70,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configurePanel() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.target = self; item.button?.action = #selector(statusClicked)
-        item.button?.sendAction(on: [.leftMouseDown, .rightMouseUp])
+        item.button?.sendAction(on: [.leftMouseDown])
         item.button?.imagePosition = .imageOnly
         let hosting = NSHostingController(rootView: ControlPanel(state: state))
         hosting.sizingOptions = [.preferredContentSize]
         panel = PanelPresenter(content: hosting, diagnostics: diagnostics)
     }
     @objc private func statusClicked() {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            panel.close(reason: "context_menu")
-            let menu = NSMenu(); menu.autoenablesItems = false
-            func add(_ title: String, action: Selector?, checked: Bool = false) {
-                let row = NSMenuItem(title: title, action: action, keyEquivalent: "")
-                row.target = self; row.state = checked ? .on : .off; row.isEnabled = action != nil
-                menu.addItem(row)
-            }
-            add(login.exists && !login.matchesCurrentApp ? "修复开机自动启动路径" : "开机自动启动", action: #selector(toggleLogin), checked: login.matchesCurrentApp)
-            add(diagnostics.isDetailed ? "关闭详细日志" : "详细日志（30 分钟）", action: #selector(toggleDetailed), checked: diagnostics.isDetailed)
-            add("打开日志文件夹", action: #selector(openLogs))
-            add("导出诊断包…", action: #selector(exportDiagnostic))
-            menu.addItem(.separator())
-            add("Keep Awake \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "开发版")", action: nil)
-            add("退出 Keep Awake", action: #selector(quit))
-            if let button = item.button { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button) }
-        } else if let button = item.button, !terminating {
+        if let button = item.button, !terminating {
             panel.toggle(anchor: button, event: NSApp.currentEvent)
         }
     }
@@ -146,43 +130,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (key, value) in display.snapshot { result["display.\(key)"] = value }
         for (key, value) in PowerController.systemSummary() { result["systemAssertions.\(key)"] = value }
         return result
-    }
-    @objc private func exportDiagnostic() {
-        guard !state.exporting, !terminating else { return }
-        panel.close(reason: "export")
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.zip]
-        panel.nameFieldStringValue = "KeepAwake-诊断-\(Date().formatted(.iso8601.year().month().day().dateSeparator(.dash))).zip"
-        panel.canCreateDirectories = true
-        NSApp.activate(ignoringOtherApps: true)
-        panel.begin { [weak self] response in
-            guard let self, response == .OK, let url = panel.url else { return }
-            self.state.exporting = true
-            self.diagnostics.record("diagnostics", "export_requested")
-            DiagnosticExporter().export(to: url, snapshot: self.snapshot()) { [weak self] result in
-                guard let self else { return }
-                self.state.exporting = false
-                switch result {
-                case .success: self.state.notice = "诊断包已保存。"
-                case .failure(let error):
-                    self.diagnostics.failure("diagnostics", "export_failed", error)
-                    self.state.notice = "导出失败：\(Diagnostics.sanitize(error.localizedDescription))"
-                }
-                self.synchronize()
-            }
-        }
-    }
-    @objc private func toggleDetailed() { diagnostics.setDetailed(!diagnostics.isDetailed); synchronize() }
-    @objc private func openLogs() { NSWorkspace.shared.open(diagnostics.directory) }
-    @objc private func toggleLogin() {
-        let enabled = !login.matchesCurrentApp
-        do {
-            try login.setEnabled(enabled)
-            diagnostics.record("login", "updated", fields: ["enabled": String(enabled), "valid": String(login.matchesCurrentApp)])
-        } catch {
-            diagnostics.failure("login", "failed", error)
-            state.notice = "登录启动设置失败：\(Diagnostics.sanitize(error.localizedDescription))"
-        }
     }
     @objc private func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

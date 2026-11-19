@@ -21,6 +21,7 @@ final class AppState: ObservableObject {
     var choosePower: (PowerMode) -> Void = { _ in }
     var chooseAutomatic: (Bool) -> Void = { _ in }
     var refreshBattery: () -> Void = {}
+    var quit: () -> Void = {}
 }
 
 private struct PanelHeightKey: PreferenceKey {
@@ -97,6 +98,16 @@ struct ControlPanel: View {
                     Button { state.notice = nil } label: { Image(systemName: "xmark") }
                         .buttonStyle(.borderless).accessibilityLabel("关闭提示")
                 }.foregroundStyle(.secondary)
+            }
+            Divider()
+            HStack {
+                Spacer()
+                Button(action: state.quit) {
+                    Label(state.quitting ? "正在退出…" : "退出", systemImage: "power")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("退出 Keep Awake")
             }
         }
         .font(.system(size: 13))
