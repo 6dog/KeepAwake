@@ -96,6 +96,21 @@ final class BuiltInDisplayTests: XCTestCase {
         }
         wait(for: [finished], timeout: 1)
     }
+    func testRecoveryTargetSurvivesDisappearanceAndAppRestartWithinSameBoot() {
+        let target = BuiltInDisplayTarget(defaults: prefs, boot: "boot-a")
+        let panel = ManagedDisplay(id: 17, identity: "panel", builtIn: true, online: true, active: true, physical: true, mirrors: 0)
+        XCTAssertEqual(target.resolve(in: [panel], restoring: false), 17)
+        let restarted = BuiltInDisplayTarget(defaults: prefs, boot: "boot-a")
+        XCTAssertEqual(restarted.resolve(in: [], restoring: true), 17)
+        XCTAssertNil(restarted.resolve(in: [], restoring: false))
+        XCTAssertNil(BuiltInDisplayTarget(defaults: prefs, boot: "boot-b").resolve(in: [], restoring: true))
+        XCTAssertNil(BuiltInDisplayTarget(defaults: prefs, boot: nil).resolve(in: [], restoring: true))
+        let external = ManagedDisplay(id: 17, identity: "external", builtIn: false, online: true, active: true, physical: true, mirrors: 0)
+        XCTAssertNil(restarted.resolve(in: [external], restoring: true))
+        let changed = ManagedDisplay(id: 21, identity: "panel", builtIn: true, online: false, active: false, physical: true, mirrors: 0)
+        XCTAssertEqual(restarted.resolve(in: [changed], restoring: true), 21)
+        XCTAssertEqual(restarted.resolve(in: [], restoring: true), 21)
+    }
     func testDefaultDoesNotDisable() {
         controller.refresh(); drain()
         XCTAssertTrue(backend.panelOnline)

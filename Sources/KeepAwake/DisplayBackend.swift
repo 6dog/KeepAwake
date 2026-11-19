@@ -27,11 +27,53 @@ protocol DisplayBackend {
     func restoreMirror(_ source: String, to target: String) throws
 }
 
+/// A software-disabled panel can disappear from even SkyLight after the last cable is removed.
+/// Remember only a confirmed built-in ID, scoped to this boot so IDs are never reused across boots.
+final class BuiltInDisplayTarget {
+    private let defaults: UserDefaults
+    private let boot: String?
+    private let key = "builtInDisplayRecoveryTarget"
+    init(defaults: UserDefaults, boot: String?) { self.defaults = defaults; self.boot = boot }
+    func resolve(in screens: [ManagedDisplay], restoring: Bool) -> CGDirectDisplayID? {
+        if let panel = screens.first(where: \.builtIn) {
+            if let boot {
+                let saved = defaults.dictionary(forKey: key)
+                if saved?["boot"] as? String != boot || saved?["id"] as? Int != Int(panel.id) {
+                    defaults.set(["boot": boot, "id": Int(panel.id)], forKey: key)
+                    defaults.synchronize()
+                }
+            }
+            return panel.id
+        }
+        guard restoring, let boot, let saved = defaults.dictionary(forKey: key),
+              saved["boot"] as? String == boot, let value = saved["id"] as? Int,
+              value > 0, value <= Int(UInt32.max) else { return nil }
+        let id = UInt32(value)
+        // A currently enumerated external display must never be mistaken for the panel.
+        guard !screens.contains(where: { $0.id == id }) else { return nil }
+        return id
+    }
+}
+
 /// Private entry points are optional at runtime; missing symbols must never prevent app launch.
 final class SkyLightDisplayBackend: DisplayBackend {
     private typealias List = @convention(c) (UInt32, UnsafeMutablePointer<UInt32>?, UnsafeMutablePointer<UInt32>?) -> CGError
     private typealias Enable = @convention(c) (CGDisplayConfigRef?, UInt32, Bool) -> CGError
     private typealias Info = @convention(c) (UInt32) -> Unmanaged<CFDictionary>?
+    private let target: BuiltInDisplayTarget
+    private let diagnostics: Diagnostics
+    init(defaults: UserDefaults = .standard, diagnostics: Diagnostics = .shared) {
+        var size = 0
+        var boot: String?
+        if sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 0 {
+            var buffer = [CChar](repeating: 0, count: size)
+            if sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 {
+                boot = String(cString: buffer)
+            }
+        }
+        target = BuiltInDisplayTarget(defaults: defaults, boot: boot)
+        self.diagnostics = diagnostics
+    }
     private let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
     private let core = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay", RTLD_LAZY)
 
@@ -53,7 +95,7 @@ final class SkyLightDisplayBackend: DisplayBackend {
             var count: UInt32 = 0
             try check(list(UInt32(capacity), &ids, &count), stage: "enumerate")
             if count < capacity {
-                return ids.prefix(Int(count)).compactMap { id in
+                let screens: [ManagedDisplay] = ids.prefix(Int(count)).compactMap { id in
                     let builtIn = CGDisplayIsBuiltin(id) != 0
                     let vendor = CGDisplayVendorNumber(id)
                     let model = CGDisplayModelNumber(id)
@@ -67,6 +109,8 @@ final class SkyLightDisplayBackend: DisplayBackend {
                         physical: builtIn || Self.isPhysical(dictionary), mirrors: CGDisplayMirrorsDisplay(id)
                     )
                 }
+                _ = target.resolve(in: screens, restoring: false)
+                return screens
             }
             capacity *= 2
         }
@@ -86,12 +130,15 @@ final class SkyLightDisplayBackend: DisplayBackend {
     }
 
     func setBuiltInEnabled(_ enabled: Bool) throws {
-        // A disabled screen disappears from public lists. Resolve it from SkyLight every time.
+        // Prefer a fresh SkyLight ID; restore from the same-boot saved target if it vanishes.
         let current = try displays()
-        guard let panel = current.first(where: \.builtIn) else {
+        guard let panelID = target.resolve(in: current, restoring: enabled) else {
             throw DisplayControlError(message: "未找到内置屏幕，请保持笔记本开盖")
         }
-        if panel.online == enabled { return }
+        if let panel = current.first(where: { $0.id == panelID }), panel.online == enabled { return }
+        if enabled && !current.contains(where: \.builtIn) {
+            diagnostics.record("display", "restore_using_saved_target", fields: ["id": String(panelID)])
+        }
         if !enabled && !current.contains(where: \.usableExternal) {
             throw DisplayControlError(message: "没有可用的实体外接屏，已取消关闭内置屏幕")
         }
@@ -99,11 +146,11 @@ final class SkyLightDisplayBackend: DisplayBackend {
         try transaction { config in
             if !enabled {
                 // Mirroring can be rooted in either screen. Detach every member of this pair.
-                for display in current where display.id == panel.id || display.mirrors == panel.id {
+                for display in current where display.id == panelID || display.mirrors == panelID {
                     if display.mirrors != 0 { try self.check(CGConfigureDisplayMirrorOfDisplay(config, display.id, 0), stage: "unmirror") }
                 }
             }
-            try self.check(set(config, panel.id, enabled), stage: enabled ? "enable" : "disable")
+            try self.check(set(config, panelID, enabled), stage: enabled ? "enable" : "disable")
         }
     }
 
